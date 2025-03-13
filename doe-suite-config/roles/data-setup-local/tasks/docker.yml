@@ -1,0 +1,53 @@
+---
+
+- block:
+  - name: Create data directory
+    ansible.builtin.file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: 0755
+        #group: "{{ euler_user if cloud == 'euler' else 'ubuntu' }}"
+        #owner: "{{ euler_user if cloud == 'euler' else 'ubuntu' }}"
+
+  - name: Upload local zip
+    copy:
+      src: "{{ does_project_dir }}/doe-suite-config/upload/applications.zip"
+      dest: "{{ data_dir }}/applications.zip"
+
+  - name: unarchive data
+    ansible.builtin.unarchive:
+      src={{ data_dir }}/applications.zip
+      dest={{ data_dir }}
+      remote_src=yes
+
+  - name: Fail task if file does not exist
+    fail:
+      msg: "The file '{{ data_dir }}/applications.zip' does not exist."
+    when: not download_data_from_aws and not file_info.stat.exists
+
+  - name: unarchive data
+    unarchive:
+      src={{ data_dir }}/applications.zip
+      dest={{ data_dir }}
+      remote_src=yes
+
+#  - name: Remove applications.zip
+#    file:
+#      path: "{{ data_dir }}/applications.zip"
+#      state: absent
+
+  - name: Ensure a file exists
+    file:
+      path: "{{ data_dir }}/ready_{{ suite_id }}"
+      state: touch
+
+
+  # only execute the role once
+  when: play_hosts.index(inventory_hostname) | int == 0 # only execute for first host overall
+
+
+- name: Wait for the file to exist
+  wait_for:
+    path: "{{ data_dir }}/ready_{{ suite_id }}"
+    state: present
+    timeout: 600 #seconds

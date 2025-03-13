@@ -1,0 +1,545 @@
+
+# make etl-super config=sp_workloads out=../doe-suite-results-super
+
+$SUITE_ID$:
+  trap: 1731489444
+  trap-relax: 1731504884
+  trap-time-threads: 1731532838
+
+$ETL$:
+
+  preprocess:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      PreProcessingDummyExtractor: # uses all available cores to preprocess each job individually and creates an output file in the job output dir
+        file_regex: [stderr.log]
+      IgnoreExtractor:
+        file_regex: [".*.csv$", ".*.json$", ".*.yaml$", "stdout.log", "gurobi.log"]
+    transformers: []
+    loaders: {}
+
+  combined:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      JsonExtractor:
+        file_regex: ["trap_analysis.json", "trap_analysis_all.json", "schema.json"]
+      IgnoreExtractor:
+        file_regex: [all_blocks.json, all_requests.json, stats.json, runtime_log.csv, round_log.csv, request_log.csv, ".*.yaml$", ".*.log$"]
+      FilterCsvExtractor:
+        file_regex: [round_request_summary.csv]
+        config_filter:
+          allocation: ["dpk-gurobi"]  # pre filter
+    transformers:
+      - name: RoundRequestSummaryTransformer
+      - name: AcceptUnlimitedLabelTransformer
+      - name: MergeRequestSummaryTransformer
+      - name: TrapCombinedAnalysisTransformer
+      - name: GreaterThanTransformer
+        output_column: violation_category_member
+        metric: max_epsilon
+        comparison_value: 5.0
+        selector:
+          - { correlation_level: "MEMBER", trap_type: "category" }
+      - name: AssignSuiteTrapTypeTransformer
+        assignment:
+          - key: ['20-1w-12w-relaxation', 'mixed:GM-LM-RR-LSVT-SGD-PATE-sub25100-defpa']
+            trap_type: relaxation
+          - key: ['20-1w-12w-morecat', 'mixed:GM-LM-RR-LSVT-SGD-PATE-sub25100-defpa']
+            trap_type: category
+          - key: ['20-1w-12w-time', 'mixed:GM-LM-RR-LSVT-SGD-PATE-sub25100-defpa']
+            trap_type: time
+      - name: GreaterThanColumnSplitTransformer
+        output_column: violation_relaxation_nasr_value
+        mark_column: violation_relaxation_nasr
+        metric: max_epsilon
+        selector:
+          - { relaxation_type: "NONE", trap_type: "relaxation", "budget_name": "eps3", "$comparison_value$": 1.7 }
+          - { relaxation_type: "NONE", trap_type: "relaxation", "budget_name": "eps5", "$comparison_value$": 1.83 }
+          - { relaxation_type: "NONE", trap_type: "relaxation", "budget_name": "eps7", "$comparison_value$": 1.9 }
+          - { relaxation_type: "NONE", trap_type: "relaxation", "budget_name": "eps10", "$comparison_value$": 2.0 }
+          - { relaxation_type: "NONE", trap_type: "relaxation", "budget_name": "eps15", "$comparison_value$": 2.25 }
+          - { relaxation_type: "NONE", trap_type: "relaxation", "budget_name": "eps20", "$comparison_value$": 2.5 }
+      - name: GreaterThanColumnSplitTransformer
+        output_column: violation_category_member_value
+        mark_column: violation_relaxation_category_member
+        metric: max_epsilon
+        selector:
+          - { trap_type: "category", correlation_level: "MEMBER", "$comparison_value$": 5.0 }
+          - { trap_type: "category", correlation_level: "MEMBER_STRONG", "$comparison_value$": 7.5 }
+          - { trap_type: "category", correlation_level: "MEMBER_STRONG_WEAK", "$comparison_value$": 10.0 }
+      - name: GreaterThanColumnSplitTransformer
+        output_column: violation_time_value
+        mark_column: violation_time
+        metric: max_epsilon
+        selector:
+          - { trap_type: "time", "source_file": "trap_analysis.json", "$comparison_value$": 3.0 }
+      - name: RelativeCorrectionTransformer
+        metric: max_epsilon
+        decomposed_col: violation_category_member_value
+        relative_col: correlation_level
+        relatives: [MEMBER, MEMBER_STRONG, MEMBER_STRONG_WEAK]
+        selector: { trap_type: "category" }
+      - df.query: { expr: "system_name != 'unlimited'" } # toggle: show all group or not
+    loaders:
+      CsvSummaryLoader: {}
+      MyCustomColumnCrossPlotLoader:
+        data_filter:
+          allowed:
+            system_name: [unlimited, dpolicy, cohere] #[unlimited, dpolicy, cohere]
+            budget_name: [eps3, eps5, eps7, eps10, eps15, eps20, inf]
+            allocation: [dpk-gurobi]
+            composition: [block-composition-pa]
+            workload_profit: [ncd]
+            trap_type: [relaxation, attribute, category, time]
+            #workload.mechanism_mix: [mixed:GM-LM-RR-LSVT-SGD-PATE]
+
+        fig_foreach:
+          cols: [] #[$metrics$]
+          # jp_except...
+
+        # define metrics (select the data columns)
+        metrics:
+          trap:
+            value_cols: [max_epsilon]
+            unit_label: "$\\epsilon$"
+
+          utility:
+            value_cols: [profit_all_accepted]
+            #error_cols: []
+            unit_label: util
+
+        ########## Configure each plot:
+        cum_plot_config:
+#        - legend_fig: {label: {template: "{value_col}"}, kwargs: {loc: "lower left", ncol: 3, bbox_to_anchor: [0.07, 1.0], columnspacing: 3.5,  fancybox: True}}
+        - #jp_query: ("$metrics$" != 'verifier_time')
+          subplot_grid:
+            rows: [$metrics$]
+            cols: [trap_type]
+            subplot_size: {w: 5, h: 2.5}
+            share_y: none
+            share_x: none
+#            kwargs:
+#              constrained_layout: True
+
+
+        ########## Configure each Subplot:
+        cum_subplot_config:
+
+        - xaxis:
+            tick_params:
+            - {axis: x, which: both, labelsize: 8}
+            - {axis: x, which: major, pad: 12}
+          chart:
+            group_foreach:
+              cols: [system_name]
+              label: {template: "{system_name}"}
+
+            group_padding: 2
+            bar_padding: 0.5
+            bar_width: 2
+
+            bar_foreach:
+              cols: [budget_name, violation_category_member, violation_relaxation_nasr, violation_time]
+              label: {template: "{budget_name}"}
+              jp_except: "((budget_name == 'inf') && (system_name != 'unlimited')) || ((budget_name != 'inf') && (system_name == 'unlimited'))"
+
+            part_foreach:
+              cols: [correlation_level, relaxation_type, violation_relaxation_nasr_value, violation_category_member_value, violation_time_value]
+
+#          apply_bar_style_jp_query: >-
+#            (violation_category_member && violation_category_member == `True`) || (violation_relaxation_nasr && violation_relaxation_nasr == `True`) || `false`
+          apply_line_jp_query: "(trap_type == 'relaxation') && (subplot_row_idx == `0`)"
+          axhlines:
+            - y: 3.0
+              label: "$\\epsilon$=3.0"
+              value_col: "time_privacy_unit"
+              jp_query: "(trap_type == 'time') && (subplot_row_idx == `0`)"
+            - y: 5.0
+              label: "$\\epsilon$=5.0"
+              value_col: "max_epsilon_member"
+              jp_query: "(trap_type == 'category') && (subplot_row_idx == `0`)"
+            - y: 7.5
+              label: "$\\epsilon$=7.5"
+              value_col: "max_epsilon_member_strong"
+              jp_query: "(trap_type == 'category') && (subplot_row_idx == `0`)"
+            - y: 10.0
+              label: "$\\epsilon$=10.0"
+              value_col: "max_epsilon_member_strong_weak"
+              jp_query: "(trap_type == 'category') && (subplot_row_idx == `0`)"
+        - jp_query: (subplot_row_idx == `0`) # Only show plot titles on top
+          ax_title:
+            template: "{trap_type}"
+        - jp_query: (subplot_row_idx == `1` && subplot_col_idx == `0`) # Show utility on bottom
+          yaxis:
+            label: {template: "{$metrics$}"}
+            major_formatter: round_short
+            lim:
+              min: 0
+              max: 10000000
+        - jp_query: (subplot_row_idx == `1`)
+          yaxis:
+            major_formatter: round_short
+            lim:
+              min: 0
+              max: 10000000
+        - jp_query: (subplot_row_idx == `0` && subplot_col_idx == `0`) # Only show y axis label on the left
+          yaxis:
+            label: { template: "{$metrics$}" }
+            major_formatter: round_short
+            lim:
+              min: 0
+              max: 22
+        - jp_query: (subplot_row_idx == `0` && subplot_col_idx == `1`) # Only show y axis label on the left
+          yaxis:
+            major_formatter: round_short
+            lim:
+              min: 0
+              max: 22
+        - jp_query: (subplot_row_idx == `0` && subplot_col_idx == `2`) # Only show y axis label on the left
+          yaxis:
+            major_formatter: round_short
+            lim:
+              min: 0
+              max: 8.8
+
+        - jp_query: "(subplot_row_idx == `0`) && (trap_type == 'relaxation')" # Only show y axis label on the left
+          legend_ax: { label: {template: "{value_col}"}, kwargs: {loc: "upper left", ncol: 1, bbox_to_anchor: [0.02, 1.0], columnspacing: 3.5, fancybox: True}}
+        - jp_query: "(subplot_row_idx == `0`) && (trap_type == 'category')" # Only show y axis label on the left
+          legend_ax: { label: {template: "{value_col}"}, kwargs: {loc: "upper left", ncol: 1, bbox_to_anchor: [0.02, 1.0], columnspacing: 3.5, fancybox: True}}
+        - jp_query: "(subplot_row_idx == `0`) && (trap_type == 'time')" # Only show y axis label on the left
+          legend_ax: { label: {template: "{value_col}"}, kwargs: {loc: "upper left", ncol: 1, bbox_to_anchor: [0.02, 1.0], columnspacing: 3.5, fancybox: True}}
+
+          ###### Configure each element (artist) in subfigure (ax)
+        - cum_artist_config:
+
+          # HLINES
+          - color: "#91E5F6" # "#EEBAB4" # "#F0E442" #E69F00" # "#E69F00"
+            jp_query: "value_col && value_col == 'max_epsilon_member_strong_weak' || `false`"
+          - color: "#59A5D8" # "#E57A77" #"#D55E00"
+            label: "Strong Connection"
+            jp_query: "value_col && value_col == 'max_epsilon_member_strong' || `false`"
+          - color: "#052F5F" # "#F05039" # "#000000"
+            label: "Member"
+            jp_query: "value_col && value_col == 'max_epsilon_member' || `false`"
+          - color: "#052F5F"
+            label: "Time"
+            jp_query: "value_col && value_col == 'time_privacy_unit' || `false`"
+
+          ## SCOPE
+          ## old strong and weak: #59A5D8, #91E5F6
+          - color: "#91E5F6" # "#EEBAB4" # "#F0E442" #E69F00" # "#E69F00"
+            label: "Weak Connection"
+            jp_query: "correlation_level && contains(correlation_level, 'MEMBER_STRONG_WEAK') || `false`"
+          - color: "#59A5D8" # "#E57A77" #"#D55E00"
+            label: "Strong Connection"
+            jp_query: "correlation_level && contains(correlation_level, 'MEMBER_STRONG') || `false`"
+          - color: "#052F5F" # "#F05039" # "#000000"
+            hatch: "////"
+            edgecolor: white
+            label: "Member"
+            jp_query: "correlation_level && contains(correlation_level, 'MEMBER') && violation_category_member_value && violation_category_member_value == 'True' || `false`"
+          - color: "#052F5F" # "#F05039" # "#000000"
+            label: "Member"
+            jp_query: "correlation_level && contains(correlation_level, 'MEMBER') && violation_category_member_value && violation_category_member_value == 'False' || `false`"
+
+          ## CONTEXT (RELAXATION)
+          - color: "#91E5F6" # "#59A5D8" #"#D7E4F1" # "#E57A77" #"#D55E00"
+            label: "Blackbox ML"
+            jp_query: "relaxation_type && contains(relaxation_type, 'BLACKBOX') || `false`"
+
+          - color: "#052F5F" # "#F05039" # "#000000"
+            hatch: "////"
+            edgecolor: "white"
+            label: "Standard"
+            jp_query: "relaxation_type && contains(relaxation_type, 'NONE') && violation_relaxation_nasr_value && violation_relaxation_nasr_value == 'True' || `false`"
+          - color: "#052F5F" # "#F05039" # "#000000"
+            label: "Standard"
+            jp_query: "relaxation_type && contains(relaxation_type, 'NONE') && violation_relaxation_nasr_value && violation_relaxation_nasr_value == 'False' || `false`"
+
+          ## TIME
+          - color: "#052F5F" # "#F05039" # "#000000"
+            hatch: "////"
+            label: "UserMonth"
+            edgecolor: "white"
+            jp_query: "subplot_row_idx == `0` && contains(trap_type, 'time') && violation_time_value && violation_time_value == 'True' || `false`"
+          - color: "#052F5F" # "#F05039" # "#000000"
+            label: "UserMonth"
+            jp_query: "subplot_row_idx == `0` && contains(trap_type, 'time') && violation_time_value && violation_time_value == 'False' || `false`"
+
+          ## Utility bars
+          - color: "#DDDDDD" # grey out utility bar for time
+            jp_query: "subplot_row_idx == `1` && violation_time && violation_time == 'True' || `false`"
+          - color: "#DDDDDD" # grey out utility bar for scope
+            jp_query: "subplot_row_idx == `1` && violation_category_member && violation_category_member == 'True' || `false`"
+          - color: "#DDDDDD" # grey out utility bar for relaxation (context)
+            jp_query: "subplot_row_idx == `1` && violation_relaxation_nasr && violation_relaxation_nasr == 'True' || `false`"
+
+          - color: "#AAAAAA"
+
+          label_map:
+
+            eps3: "$\\epsilon_t$: 3    "
+            eps5: "5"
+            eps7: "7"
+            eps10: "10"
+            eps15: "15"
+            eps20: "20"
+            inf: inf
+            unlimited: All
+
+            cohere: Cohere
+            dpolicy: DPolicy
+
+            trap: "Privacy Cost ($\\epsilon$)"
+            utility: Utility
+
+            relaxation: Context
+            category: Scope (Category)
+            time: (Time-based) Privacy Unit
+
+            profit_elephant_accepted: Elephants
+            profit_hare_accepted: Hares
+            profit_mice_accepted: Mice
+
+            n_requests_elephant_accepted: Elephants
+            n_requests_hare_accepted: Hares
+            n_requests_mice_accepted: Mice
+
+  context:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      $INCLUDE_STEPS$:  [{config: trap-combined, pipeline: combined}]
+    transformers:
+      - $INCLUDE_STEPS$:  {config: trap-combined, pipeline: combined}
+      - df.query: { expr: "trap_type == 'relaxation'" }
+    loaders:
+      $INCLUDE_STEPS$:  [{config: trap-combined, pipeline: combined}]
+
+
+  scope_category:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      $INCLUDE_STEPS$:  [{config: trap-combined, pipeline: combined}]
+    transformers:
+      - $INCLUDE_STEPS$:  {config: trap-combined, pipeline: combined}
+      - df.query: { expr: "trap_type in ['category']" }
+    loaders:
+      $INCLUDE_STEPS$:  [{config: trap-combined, pipeline: combined}]
+
+  time_privacy_unit:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      $INCLUDE_STEPS$:  [{config: trap-combined, pipeline: combined}]
+    transformers:
+      - $INCLUDE_STEPS$:  {config: trap-combined, pipeline: combined}
+      - df.query: { expr: "trap_type in ['time']" }
+    loaders:
+      $INCLUDE_STEPS$:  [{config: trap-combined, pipeline: combined}]
+
+  scope_attribute:
+    experiments:
+      trap: "*"
+    extractors:
+      JsonExtractor:
+        file_regex: ["trap_analysis.json", "trap_analysis_all.json", "schema.json"]
+      IgnoreExtractor:
+        file_regex: [all_blocks.json, all_requests.json, stats.json, runtime_log.csv, round_log.csv, request_log.csv, ".*.yaml$", ".*.log$"]
+      FilterCsvExtractor:
+        file_regex: [round_request_summary.csv]
+        config_filter:
+          allocation: ["dpk-gurobi"]  # pre filter
+    transformers:
+      - name: RoundRequestSummaryTransformer
+      - name: AcceptUnlimitedLabelTransformer
+      - name: MergeRequestSummaryTransformer
+      - name: TrapCombinedAnalysisTransformer
+      - name: AssignSuiteTrapTypeTransformer
+        assignment:
+          - key: ['20-1w-12w-morecat', 'mixed:GM-LM-RR-LSVT-SGD-PATE-sub25100-defpa']
+            trap_type: attribute
+      - name: GreaterThanColumnSplitTransformer
+        output_column: violation_attribute_member_value
+        mark_column: violation_attribute_member
+        metric: max_epsilon
+        selector:
+          - { trap_type: "attribute", "source_file": "trap_analysis.json", "$comparison_value$": 3.0 }
+      - df.query: { expr: "system_name != 'unlimited'" } # show all vs hide all
+    loaders:
+      CsvSummaryLoader: {}
+      MyCustomColumnCrossPlotLoader:
+        data_filter:
+          allowed:
+            system_name: [unlimited, dpolicy, cohere]
+            budget_name: [eps3, eps5, eps7, eps10, eps15, eps20, inf]
+            allocation: [dpk-gurobi]
+            composition: [block-composition-pa]
+            workload_profit: [ncd]
+            trap_type: [attribute]
+
+        fig_foreach:
+          cols: [] #[$metrics$]
+          # jp_except...
+
+        # define metrics (select the data columns)
+        metrics:
+          trap:
+            value_cols: [max_epsilon]
+            unit_label: "ε"
+
+          utility:
+            value_cols: [profit_all_accepted]
+            #error_cols: []
+            unit_label: util
+
+        ########## Configure each plot:
+        cum_plot_config:
+          #        - legend_fig: {label: {template: "{value_col}"}, kwargs: {loc: "lower left", ncol: 3, bbox_to_anchor: [0.07, 1.0], columnspacing: 3.5,  fancybox: True}}
+          - #jp_query: ("$metrics$" != 'verifier_time')
+            subplot_grid:
+              rows: [$metrics$]
+              cols: [trap_type]
+              subplot_size: {w: 5, h: 2.5}
+              share_y: none
+              share_x: none
+              #kwargs:
+              #  constrained_layout: True
+
+
+        ########## Configure each Subplot:
+        cum_subplot_config:
+
+          - xaxis:
+              tick_params:
+                - {axis: x, which: both, labelsize: 8}
+                - {axis: x, which: major, pad: 12}
+            chart:
+              group_foreach:
+                cols: [system_name]
+                label: {template: "{system_name}"}
+
+              group_padding: 2
+              bar_padding: 0.5
+              bar_width: 2
+
+              bar_foreach:
+                cols: [budget_name, violation_attribute_member]
+                label: {template: "{budget_name}"}
+                jp_except: "((budget_name == 'inf') && (system_name != 'unlimited')) || ((budget_name != 'inf') && (system_name == 'unlimited'))"
+
+              part_foreach:
+                cols: [correlation_level, relaxation_type, violation_attribute_member_value]
+
+#            apply_bar_style_jp_query: >-
+#              (violation_attribute_member && violation_attribute_member == `True`) || `false`
+#            apply_line_jp_query: "(trap_type == 'relaxation') && (subplot_row_idx == `0`)"
+            axhlines:
+              - y: 3.0
+                label: "ε=3.0"
+                value_col: "max_epsilon_attribute"
+                jp_query: "(trap_type == 'attribute') && (subplot_row_idx == `0`)"
+          - jp_query: (subplot_row_idx == `0`) # Only show plot titles on top
+            ax_title:
+              template: "{trap_type}"
+          - jp_query: (subplot_row_idx == `1`) # Show utility on bottom
+            yaxis:
+              label: {template: "{$metrics$}"}
+              major_formatter: round_short
+              lim:
+                min: 0
+                max: 10000000
+          - jp_query: (subplot_row_idx == `0` && subplot_col_idx == `0`) # Only show y axis label on the left
+            yaxis:
+              label: { template: "{$metrics$}" }
+              major_formatter: round_short
+
+
+
+            ###### Configure each element (artist) in subfigure (ax)
+          - cum_artist_config:
+              #          - color: "#666666"
+              #            jp_query: "part_value && part_value > `3.0` || `false`"
+
+              # TODO: In transformer make correlatoin levels relative for MEMBER
+
+              # line
+
+              - color: "#052F5F"
+                label: "Attribute"
+                jp_query: "value_col && value_col == 'max_epsilon_attribute' || `false`"
+
+              - color: "#052F5F" # "#F05039" # "#000000"
+                hatch: "////"
+                edgecolor: white
+                label: "Member"
+                jp_query: "violation_attribute_member_value && violation_attribute_member_value == `True` || `false`"
+              - color: "#052F5F" # "#F05039" # "#000000"
+                label: "Member"
+                jp_query: "subplot_row_idx == `0` && violation_attribute_member_value && violation_attribute_member_value == `False` || `false`"
+
+#              - edgecolor: red
+#                color: none
+#                jp_query: "subplot_row_idx == `0` && bar_style && violation_attribute_member && violation_attribute_member == 'True' || `false`"
+
+              - color: "#DDDDDD" # grey out utility bar for scope
+                jp_query: "subplot_row_idx == `1` && violation_attribute_member && violation_attribute_member == 'True' || `false`"
+
+
+              - color: "#AAAAAA"
+
+
+
+            label_map:
+
+              eps3: "$\\epsilon_t$: 3    " #"ε: 3    "
+              eps5: "5"
+              eps7: "7"
+              eps10: "10"
+              eps15: "15"
+              eps20: "20"
+              inf: inf
+              unlimited: All
+
+              cohere: Cohere
+              dpolicy: DPolicy
+
+              trap: "Privacy Cost ($\\epsilon$)"
+              utility: Utility
+
+              relaxation: Context
+              category: Scope
+              time: Privacy Units
+              attribute: Scope (Attribute)
+
+              profit_elephant_accepted: Elephants
+              profit_hare_accepted: Hares
+              profit_mice_accepted: Mice
+
+              n_requests_elephant_accepted: Elephants
+              n_requests_hare_accepted: Hares
+              n_requests_mice_accepted: Mice
+
+#  attribute:
+#    experiments:
+#      trap: "*"
+#    extractors:
+#      $INCLUDE_STEPS$: [ { config: trap-combined, pipeline: attribute_all } ]
+#    transformers:
+#      - $INCLUDE_STEPS$: { config: trap-combined, pipeline: attribute_all }
+#      - df.query: { expr: "system_name != 'unlimited'" }
+#    loaders:
+#      $INCLUDE_STEPS$: [ { config: trap-combined, pipeline: attribute_all } ]

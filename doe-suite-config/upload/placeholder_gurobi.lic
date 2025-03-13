@@ -1,0 +1,9 @@
+# Gurobi WLS license file
+# Your credentials are private and should not be shared or copied to public repositories.
+# Visit https://license.gurobi.com/manager/doc/overview for more information.
+WLSACCESSID=<YOUR-ACCESS-ID>
+WLSSECRET=<YOUR-WLS-SECRET>
+LICENSEID=<YOUR-LICENSE-ID>
+
+
+# TODO: Set these values accoridng to your license and rename the file to `gurobi.lic`

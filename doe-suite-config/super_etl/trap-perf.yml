@@ -1,0 +1,103 @@
+
+# make etl-super config=sp_workloads out=../doe-suite-results-super
+
+$SUITE_ID$:
+
+  trap: 1731489444
+  trap-relax: 1731504884
+  trap-time-threads: 1731532838 #1731517984 # 1731417115
+
+$ETL$:
+
+  preprocess:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      PreProcessingDummyExtractor: # uses all available cores to preprocess each job individually and creates an output file in the job output dir
+        file_regex: [stderr.log]
+      IgnoreExtractor:
+        file_regex: [".*.csv$", ".*.json$", ".*.yaml$", "stdout.log", "gurobi.log"]
+    transformers: []
+    loaders: {}
+
+  perf:
+    experiments:
+      trap: "*"
+      trap-relax: "*"
+      trap-time-threads: "*"
+    extractors:
+      CsvExtractor:
+        file_regex: ["runtime_log.csv"]
+      IgnoreExtractor:
+        file_regex: ["^(?!runtime_log.csv$).*.csv$", ".*.json$", ".*.yaml$", ".*.log$"]
+    transformers: []
+    loaders:
+      CsvSummaryLoader: {}
+      MyCustomColumnCrossPlotLoader:
+        data_filter:
+          allowed:
+            system_name: [dpolicy, cohere]
+            budget_name: [eps3, eps5, eps7, eps10, eps15, eps20]
+            allocation: [dpk-gurobi]
+            composition: [block-composition-pa]
+            workload_profit: [ncd]
+            kind: [RoundSetup, Segmentation, PostSegmentation, RunAllocationAlgorithm]
+
+        fig_foreach:
+          cols: []
+        metrics:
+          runtime:
+            value_cols: [measurement_millis]
+            value_divider: 1000.0
+            unit_label: sec
+
+
+        ########## Configure each plot:
+        cum_plot_config:
+        - legend_fig: {label: {template: "{kind}"}, kwargs: {loc: "lower left", ncol: 4, bbox_to_anchor: [0.07, 1.0], columnspacing: 3.5,  fancybox: True}}
+          subplot_grid:
+            rows: [suite_name, system_name]
+            cols: [budget_name]
+            subplot_size: {w: 5, h: 2.5}
+            share_y: all
+            share_x: all
+
+        ########## Configure each Subplot:
+        cum_subplot_config:
+        - jp_query: (subplot_col_idx == `0`)
+          yaxis:
+            label: {template: "{suite_name} {system_name}: {$metrics$} [{$metric_unit$}]"}
+            major_formatter: round_short
+        - jp_query: (subplot_row_idx == `0`)
+          ax_title: {template: "{budget_name}"}
+        - xaxis:
+            label: {template: "Round"}
+            tick_params:
+            - {axis: x, which: both, labelsize: 8}
+            - {axis: x, which: major, pad: 12}
+          chart:
+            group_foreach: {cols: []}
+
+            bar_width: 2
+
+            bar_foreach:
+              cols: [round]
+              label: {template: "{round}"}
+
+            part_foreach:
+              cols: [kind]
+              label: {template: "{kind}"}
+
+        ###### Configure each element (artist) in subfigure (ax)
+        - cum_artist_config:
+        # colors from: https://davidmathlogic.com/colorblind/#%23000000-%23E69F00-%2356B4E9-%23009E73-%23F0E442-%230072B2-%23D55E00-%23CC79A7
+          - color: "black" # "#000000"
+            jp_query: (kind == 'RoundSetup')
+          - color: "#D8D7D2" # "#000000"
+            jp_query: (kind == 'Segmentation')
+          - color: "#009E73" #"#D55E00"
+            jp_query: (kind == 'PostSegmentation')
+          - color: "#99d8c7" # "#F0E442" #E69F00" # "#E69F00"
+            jp_query: (kind == 'RunAllocationAlgorithm')

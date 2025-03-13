@@ -1,0 +1,83 @@
+FROM ubuntu:20.04
+
+# Define Gurobi version and installation directory for easier updates
+ARG GUROBI_VERSION=9.5.1
+ARG GUROBI_MAJOR_MINOR=9.5
+ARG GUROBI_INSTALL_DIR=/opt/gurobi${GUROBI_VERSION}
+
+# Update apt and install base dependencies + SSH + Python + Gurobi prerequisites
+# Added wget, python3-pip, python3-dev, ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    sudo \
+    curl \
+    build-essential \
+    m4 \
+    rsync \
+    time \
+    unzip \
+    python3 \
+    python3-pip \
+    python3-dev \
+    wget \
+    ca-certificates \
+    # Clean up apt cache to reduce image size
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Configure SSH - Allow root login (as in original) and ensure PasswordAuthentication is possible if needed
+# Also handle commented out lines
+RUN sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# Create user ubuntu, set password, add to sudoers, setup SSH key
+RUN useradd -m -s /bin/bash ubuntu
+RUN echo "ubuntu:test" | chpasswd && adduser ubuntu sudo
+RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+# Ensure .ssh directory exists and set correct permissions for authorized_keys
+USER ubuntu
+RUN mkdir -p /home/ubuntu/.ssh && chmod 700 /home/ubuntu/.ssh
+USER root
+COPY docker_public_key.pub /home/ubuntu/.ssh/authorized_keys
+RUN chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys && chmod 600 /home/ubuntu/.ssh/authorized_keys
+
+# Download and install Gurobi
+# Using WORKDIR to simplify paths and ARG for version flexibility
+WORKDIR /tmp
+# --- MODIFIED SECTION ---
+RUN wget https://packages.gurobi.com/${GUROBI_MAJOR_MINOR}/gurobi${GUROBI_VERSION}_linux64.tar.gz -O gurobi.tar.gz && \
+    tar xvfz gurobi.tar.gz && \
+    # Use wildcard (*) instead of bash-specific substitution. Assumes only one 'gurobi*' dir.
+    mv gurobi*/linux64 ${GUROBI_INSTALL_DIR} && \
+    # Clean up downloaded archive and extracted folder structure using wildcard
+    rm gurobi.tar.gz && \
+    rm -rf gurobi*
+# --- END MODIFIED SECTION ---
+
+# Set Gurobi environment variables system-wide
+# These ENV variables are useful for processes run directly by Docker (e.g., during build)
+ENV GUROBI_HOME=${GUROBI_INSTALL_DIR}
+ENV PATH="${GUROBI_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${GUROBI_HOME}/lib:${LD_LIBRARY_PATH}"
+
+# Add Gurobi env vars to profile scripts for interactive SSH sessions
+# This ensures users logging in via SSH inherit the Gurobi environment
+# Using '\$' to escape variables intended for the profile script, not the build stage
+RUN echo "export GUROBI_HOME=${GUROBI_HOME}" >> /etc/profile.d/gurobi.sh && \
+    echo "export PATH=\${GUROBI_HOME}/bin:\${PATH}" >> /etc/profile.d/gurobi.sh && \
+    echo "export LD_LIBRARY_PATH=\${GUROBI_HOME}/lib:\${LD_LIBRARY_PATH}" >> /etc/profile.d/gurobi.sh
+
+# Install gurobipy Python package using the setup.py provided by Gurobi
+WORKDIR ${GUROBI_HOME}
+RUN python3 setup.py install
+
+# SSH setup finalize
+EXPOSE 22
+RUN mkdir -p /var/run/sshd
+
+# Reset WORKDIR to root for final command
+WORKDIR /
+
+# Command to run SSH daemon
+CMD ["/usr/sbin/sshd", "-D"]

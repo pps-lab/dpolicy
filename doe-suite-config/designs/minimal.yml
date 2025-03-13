@@ -1,0 +1,79 @@
+
+$SUITE_VARS$:
+
+  workload_dir: "[% my_run.data_base_dir %]/[% my_run.workload.name %]/[% my_run.workload_profit %]_[% my_run.workload_mode %]"
+
+  $INCLUDE_VARS$: [sp_scenario.yml, defaults_v2.yml]
+
+scale_small:
+  n_repetitions: 1
+  common_roles: [setup-cohere, data-setup-local]
+  host_types:
+    gurobi:
+      init_roles: [setup-gurobi]
+      n: 1
+      # after the simulation, we run the trap analysis + (for run_0 the trap analysis of the workload if all requests would have been accepted)
+      $CMD$: "[% my_run.cmd_simulation %] && [% my_run.cmd_trap_analysis %] [% '&& [% my_run.cmd_trap_analysis_all %]' if run == 0 else '' %]"
+
+  base_experiment:
+    scenario: "13-1w-12w-minimal"
+    gurobi_env: gurobi_4threads_2h.env
+
+    allocation: dpk-gurobi
+
+    workload_profit: ncd
+    budget_name: eps5
+
+
+    privacy_unit: "User"
+    cache_request_cost: $FACTOR$
+
+
+    system_name: $FACTOR$
+    $euler_job_minutes$: $FACTOR$
+
+    workload_mode: "[% my_run.system_name %]-[% my_run.budget_name %]-[% my_run.privacy_unit %]" #dpolicy
+
+    # NOTE: There are 12 blocks in each active window => this is the most memory + performance critical part of each round
+    #         -> by having the threads == active window size we have the performance (but also the the most memory requirements)
+    num_threads_segmentation: 6 #12
+
+    composition: block-composition-pa --num-threads [% my_run.num_threads_segmentation %]
+
+    workload:
+      mechanism_mix: mixed:GM-LM-RR-LSVT-SGD-PATE
+      sub_mix: "sub25100"
+      pa_mix: "defpa"
+      name: "[% my_run.workload.mechanism_mix %]-[% my_run.workload.sub_mix %]-[% my_run.workload.pa_mix %]"
+      rep: 0
+
+    budget:
+      ModeConfig:
+        Unlocking:
+          slack: 0.4
+
+  factor_levels:
+#    - system_name: cohere
+#      $euler_job_minutes$: 240
+#      cache_request_cost: 0
+    - system_name: dpolicy
+      $euler_job_minutes$: 1440
+      cache_request_cost: 1
+
+
+$ETL$:
+
+  overview:
+    experiments: "*"
+    extractors:
+      ErrorInfoExtractor: {}
+      IgnoreExtractor:
+        file_regex: [trap_analysis_all.json, trap_analysis.json, round_request_summary.csv, runtime_log.csv, round_log.csv, stats.json, schema.json, all_blocks.json, all_requests.json, stdout.log, gurobi.log, gen_history_.*, request_log.csv]
+      YamlExtractor:
+        file_regex: [runtime_info.yaml]
+    transformers: []
+    loaders:
+      #CsvSummaryLoader: {skip_empty: True}
+      WarningLoader:
+        cols: ["$FACTORS$", "wall_time", "max_rss"]
+        warning_col: "error"

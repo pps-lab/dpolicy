@@ -1,0 +1,24 @@
+---
+
+instance_type: c5.4xlarge
+ec2_volume_size: 500
+
+ec2_image_id:  ami-0dbde701009dcba2f
+ec2_volume_snapshot: snap-08c5c6e9eed385607
+
+euler_job_minutes: 240 # -> 4h
+euler_cpu_cores: 12 #16 <- TODO: 16 was the value in Cohere
+euler_cpu_mem_per_core_mb: 5120 # -> this is memory per core
+
+euler_gpu_number: 0
+euler_gpu_min_mem_per_gpu_mb: 0
+euler_gpu_model: ~
+euler_env: stack/2024-06 gcc/12.2.0 m4/1.4.19-5so3gvs python/3.11.6 flex/2.6.3 bison/3.8.2 gurobi/9.0.0 eth_proxy
+
+euler_scratch_dir: "/cluster/scratch/{{ euler_user }}"
+
+
+attach_eni: True
+
+docker_image_id:  "gurobi951"
+docker_image_tag: "latest"
