@@ -502,12 +502,12 @@ cargo run --release --bin dp_planner --                             \
             --kp-solver gurobi                                      \
                                                                     \
     block-composition-pa                                            \
+        --num-threads 6                                             \
     unlocking-budget                                                \
         --trigger round                                             \
         --slack 0.4                                                 \
         --n-steps 12                                                \
-        --epsilon 3.0                                               \
-        --delta 1e-07                                               \
+        --convert-block-budgets                                     \
         --alphas 1.5 1.75 2 2.5 3 4 5 6 8 16 32 64 1e6 1e10
 ```
 

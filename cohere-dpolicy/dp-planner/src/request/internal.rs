@@ -3,9 +3,10 @@ use super::{
     AttributeId, Conjunction, ConjunctionBuilder, DNFRepeatingIterator, Predicate,
     PredicateWithSchema,
 };
+use crate::dprivacy::privacy_unit::PrivacyUnit;
+use crate::dprivacy::AccountingType;
 use crate::request::external::ExternalRequest;
 use crate::request::{external, Dnf};
-use crate::schema::DataValueLookup;
 use crate::Request;
 use itertools::{Itertools, MultiProduct};
 use std::collections::HashMap;
@@ -211,6 +212,7 @@ impl Predicate {
 mod tests {
     use crate::request::RequestId;
     use crate::request::{Dnf, Request};
+    use crate::simulation::RoundId;
 
     use super::*;
 
@@ -232,6 +234,8 @@ mod tests {
                 value_domain_map: None,
             }],
             name_to_index: HashMap::new(),
+            privacy_units: HashSet::from([PrivacyUnit::User]),
+            block_sliding_window_size: 1,
         };
 
         schema.init();
@@ -250,6 +254,8 @@ mod tests {
                 value_domain_map: None,
             }],
             name_to_index: HashMap::new(),
+            privacy_units: HashSet::from([PrivacyUnit::User]),
+            block_sliding_window_size: 1,
         };
 
         schema.init();
@@ -275,6 +281,8 @@ mod tests {
             accounting_type: AccountingType::EpsDp { eps: 1.0 },
             attributes,
             name_to_index: HashMap::new(),
+            privacy_units: HashSet::from([PrivacyUnit::User]),
+            block_sliding_window_size: 1,
         };
 
         schema.init();
@@ -307,13 +315,12 @@ mod tests {
 
         Request {
             request_id: RequestId(0),
-            request_cost: schema.accounting_type.clone(),
-            unreduced_cost: schema.accounting_type.clone(),
+            request_cost: HashMap::from([(PrivacyUnit::User, schema.accounting_type.clone())]),
+            privacy_unit_selection: HashMap::new(),
             profit: 1,
             dnf: Dnf { conjunctions },
-            n_users: 1,
-            created: None,
-            adapter_info: Default::default(),
+            num_blocks: 1,
+            created: RoundId(0),
         }
     }
 
@@ -497,51 +504,38 @@ mod tests {
 }
 
 impl Request {
-    pub fn unreduce_alphas(&mut self) {
-        self.request_cost = self.unreduced_cost.clone();
-    }
-
     pub fn dnf(&self) -> &Dnf {
         &self.dnf
     }
 
+
+    pub fn request_cost(&self, privacy_unit: &PrivacyUnit) -> &AccountingType {
+        self.request_cost.get(privacy_unit).expect(&format!("missing privacy unit: {:?}   self.request_cost: {:?}", privacy_unit, self.request_cost))
+    }
+
+    pub fn all_request_costs(&self) -> &HashMap<PrivacyUnit, AccountingType> {
+        &self.request_cost
+    }
+
+    pub fn set_request_cost(&mut self, privacy_unit: PrivacyUnit, cost: AccountingType) {
+        self.request_cost.insert(privacy_unit, cost);
+    }
+
     /// Converts an internal request to external representation, to enable serialization
-    ///
-    /// Note: The request cost used is the unreduced request cost, otherwise requests
-    /// converted back to external couldn't be combined with other external requests anymore.
     pub fn to_external(&self, schema: &Schema) -> ExternalRequest {
+
+
+
         ExternalRequest {
             request_id: self.request_id,
-            request_cost: Some(self.unreduced_cost.clone()),
-            profit: Some(self.profit),
-            dnf: external::Dnf {
-                conjunctions: self
-                    .dnf
-                    .conjunctions
-                    .iter()
-                    .map(|conj| {
-                        let predicates: HashMap<String, external::Predicate> = conj
-                            .predicates
-                            .iter()
-                            .enumerate()
-                            .map(|(attr_id, pred)| {
-                                (
-                                    schema
-                                        .attribute_name(attr_id)
-                                        .expect("Couldn't get attribute name")
-                                        .to_string(),
-                                    pred.to_external(AttributeId(attr_id), schema)
-                                        .expect("Couldn't convert predicate to external"),
-                                )
-                            })
-                            .collect();
-
-                        external::Conjunction { predicates }
-                    })
-                    .collect(),
-            },
-            n_users: Some(self.n_users),
-            adapter_info: Some(self.adapter_info.clone()),
+            request_cost: self.request_cost.clone(),
+            privacy_unit_selection: self.privacy_unit_selection.clone(),
+            profit: self.profit,
+            dnf: external::ExternalDnf::from_internal(&self.dnf, schema),
+            dnf_pa: None,
+            attributes: None,
+            categories: None,
+            relaxations: None,
             created: self.created,
         }
     }

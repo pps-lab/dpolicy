@@ -7,27 +7,27 @@
 pub mod external;
 pub mod internal;
 
-pub mod adapter;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
 };
-
+use bincode::{Decode, Encode};
 use itertools::MultiProduct;
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{DataValue, DataValueLookup};
-use crate::{dprivacy::rdp_alphas_accounting::RdpAlphas, simulation::RoundId};
+use crate::{dprivacy::privacy_unit::{MyIntervalSet, PrivacyUnit}, schema::{DataValue, DataValueLookup}};
+use crate::simulation::RoundId;
 use crate::{
     schema::{Schema, SchemaError},
-    AccountingType, RequestAdapter,
+    AccountingType,
 };
+
 
 use self::internal::PredicateWithSchemaIntoIterator;
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Deserialize, PartialOrd, Ord, Serialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Deserialize, PartialOrd, Ord, Serialize, Encode, Decode)]
 pub struct RequestId(pub usize);
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -42,15 +42,64 @@ pub fn resource_path(filename: &str) -> PathBuf {
 pub fn load_requests(
     request_path: PathBuf,
     schema: &Schema,
-    request_adapter: &mut RequestAdapter,
-    alphas: &Option<RdpAlphas>,
 ) -> Result<HashMap<RequestId, Request>, SchemaError> {
     let external_requests =
         external::parse_requests(request_path).expect("Failed to open or parse requests");
-    external::convert_requests(external_requests, schema, request_adapter, alphas)
+    external::convert_requests(external_requests, schema)
+}
+
+
+pub fn load_requests_pa(
+    request_path: PathBuf,
+    schema: &Schema,
+) -> (HashMap<RequestId, Request>, BTreeMap<String, HashSet<RequestId>>, BTreeMap<String, HashSet<RequestId>>, BTreeMap<String, HashSet<RequestId>>) {
+    let mut external_requests =
+        external::parse_requests(request_path).expect("Failed to open or parse requests");
+
+    let mut attribute_lookup = BTreeMap::new();
+
+    let mut category_lookup = BTreeMap::new();
+
+    let mut relaxation_lookup = BTreeMap::new();
+
+
+    // use only the dnf_pa as the dnf
+    for r in external_requests.iter_mut() {
+
+        r.dnf = r.dnf_pa.clone().expect("No dnf_pa given in request");
+
+        let attributes = r.attributes.clone().expect("No attributes given in request");
+        for a in attributes.into_iter() {
+            attribute_lookup.entry(a.clone())
+                        .or_insert_with(HashSet::new)
+                        .insert(r.request_id);
+        }
+
+        let categories = r.categories.clone().expect("No attributes given in request");
+        for c in categories.into_iter() {
+            category_lookup.entry(c.clone())
+                        .or_insert_with(HashSet::new)
+                        .insert(r.request_id);
+        }
+
+        let relaxations = r.relaxations.clone().expect("No attributes given in request");
+        for relax in relaxations.into_iter() {
+            relaxation_lookup.entry(relax.clone())
+                        .or_insert_with(HashSet::new)
+                        .insert(r.request_id);
+        }
+
+
+    }
+
+    let requests = external::convert_requests(external_requests, schema).unwrap();
+
+    (requests, attribute_lookup, category_lookup, relaxation_lookup)
+
 }
 
 impl Dnf {
+
     pub fn repeating_iter<'a, 'b>(&'a self, schema: &'b Schema) -> DNFRepeatingIterator<'a, 'b> {
         let iters: Vec<_> = self
             .conjunctions
@@ -76,18 +125,17 @@ pub struct Request {
     /// map to access a request object.
     pub request_id: RequestId,
     /// How much cost this request incurs when it is allocated some blocks / segments of a block.
-    pub request_cost: AccountingType,
-    /// The request cost before global alpha reduction, but after the request adapter
-    /// possibly changed request costs.
-    pub unreduced_cost: AccountingType,
+    request_cost: HashMap<PrivacyUnit, AccountingType>,
+
+    pub privacy_unit_selection: HashMap<PrivacyUnit, MyIntervalSet>,
+
     /// How important this request is compared to other requests. Often times, the goal of
     /// [crate::allocation] is to maximize the total profit
     pub profit: u64,
     dnf: Dnf,
-    pub n_users: usize,
+    pub num_blocks: Option<usize>,
     /// identifies the round the request joins the system. Default: 0
-    pub created: Option<RoundId>,
-    pub(crate) adapter_info: AdapterInfo,
+    pub created: RoundId,
 }
 
 /// Records whether certain fields in a request were changed by an adapter, and if these changes
@@ -141,48 +189,38 @@ impl<'a> RequestBuilder<'a> {
     /// creating requests, as this is less error prone and easier to read.
     pub fn new(
         request_id: RequestId,
-        request_cost: AccountingType,
+        request_cost: HashMap<PrivacyUnit, AccountingType>,
+        privacy_unit_selection: HashMap<PrivacyUnit, MyIntervalSet>,
         profit: u64,
-        n_users: usize,
+        num_blocks: Option<usize>,
         schema: &'a Schema,
-        adapter_info: AdapterInfo,
     ) -> Self {
-        let request = Request {
-            request_id,
-            request_cost: request_cost.clone(),
-            unreduced_cost: request_cost,
-            profit,
-            dnf: Dnf {
-                conjunctions: Vec::new(),
-            },
-            n_users,
-            created: None,
-            adapter_info,
-        };
-
-        RequestBuilder { request, schema }
+        let created = RoundId(0);
+        RequestBuilder::new_full(request_id, request_cost, privacy_unit_selection, profit, num_blocks, created, schema)
     }
 
     pub fn new_full(
         request_id: RequestId,
-        request_cost: AccountingType,
+        request_cost: HashMap<PrivacyUnit, AccountingType>,
+        privacy_unit_selection: HashMap<PrivacyUnit, MyIntervalSet>,
         profit: u64,
-        n_users: usize,
-        created: Option<RoundId>,
+        num_blocks: Option<usize>,
+        created: RoundId,
         schema: &'a Schema,
-        adapter_info: AdapterInfo,
     ) -> Self {
+
+        request_cost.iter().for_each(|(unit, _)|  unit.check_selection(&privacy_unit_selection.get(unit).map(|x| x.clone())));
+
         let request = Request {
             request_id,
-            request_cost: request_cost.clone(),
-            unreduced_cost: request_cost,
+            request_cost,
+            privacy_unit_selection,
             profit,
             dnf: Dnf {
                 conjunctions: Vec::new(),
             },
-            n_users,
+            num_blocks,
             created,
-            adapter_info,
         };
 
         RequestBuilder { request, schema }
@@ -190,6 +228,7 @@ impl<'a> RequestBuilder<'a> {
 
     /// Add another conjunction to the dnf in the request in the [RequestBuilder]
     pub fn or_conjunction(mut self, c: Conjunction) -> Self {
+        // TODO [nku] DELETE AND REPLACE WITH INTERNAL TO EXTERNAL MAYBE?
         self.request.dnf.conjunctions.push(c);
         self
     }
@@ -207,7 +246,7 @@ impl<'a> RequestBuilder<'a> {
 }
 
 /// The disjunctive normal form of the predicates attached to a request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Dnf {
     /// Each entry is a conjunction, together making up the disjunctive normal form of the request
     /// predicates.
@@ -227,7 +266,7 @@ pub struct DNFRepeatingIterator<'a, 'b> {
 /// The basic building block for the disjunctive normal form which defines request predicates.
 ///
 /// Is part of [Dnf]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Conjunction {
     // TODO [later]: a small inefficiency is that each conjunction needs to contain a predicate for all attributes.
     // We could change this and store the "full" predicate once per schema.
@@ -256,7 +295,7 @@ pub struct ConjunctionBuilder<'a> {
 ///
 /// Note that the attribute to which a predicate belongs is not stored here, and is part of the
 /// datastructure which the predicate is part of.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum Predicate {
     // TODO [later]: Expand with Gt, Le etc
     /// The predicate is only true if the attribute takes the given value.

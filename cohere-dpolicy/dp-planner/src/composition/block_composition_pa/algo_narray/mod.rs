@@ -1,12 +1,14 @@
+use crate::block::{Block, BlockId};
 use crate::composition::{BlockConstraints, BlockSegment};
 use crate::dprivacy::budget::SegmentBudget;
+use crate::dprivacy::privacy_unit::{is_selected_block, PrivacyUnit};
+use crate::dprivacy::rdp_alphas_accounting::RdpAlphas;
 use crate::request::{Conjunction, Request, RequestId};
 use crate::schema::Schema;
 
-use super::Segmentation;
+use super::{NArrayCache, Segmentation};
 
 use float_cmp::{ApproxEq, F64Margin};
-
 use itertools::Itertools;
 
 use fasthash::{sea::Hash64, FastHash};
@@ -14,11 +16,16 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use std::collections::{HashMap, HashSet};
+use std::{fs};
+use std::fs::File;
+use bincode::{config, Decode, Encode};
+use serde::{Deserialize, Serialize};
 
-mod narray;
+pub(crate) mod narray;
 
-use crate::dprivacy::{Accounting, AccountingType};
+use crate::dprivacy::{Accounting, AccountingType, AdpAccounting};
 use narray::{Dimension, Index, NArray};
+use crate::logging::{RuntimeKind, RuntimeMeasurement};
 
 // TODO [nku] [later] write tests
 pub struct NArraySegmentation<'r, 's> {
@@ -28,9 +35,9 @@ pub struct NArraySegmentation<'r, 's> {
     schema: &'s Schema,
 }
 
-#[derive(Clone)]
-struct VirtualBlockBudget {
-    budget: AccountingType,
+#[derive(Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct VirtualBlockBudget {
+    budget: Option<AccountingType>, // TODO: Using AccountingType here is not the best idea because the size of each element depends on the largest enum variant (which is rdp16)
     prev_request_id: Option<RequestId>,
 }
 
@@ -38,7 +45,7 @@ struct VirtualBlockBudget {
 struct VirtualBlockRequested {
     request_hash: u64,
     request_count: u32,
-    cost: AccountingType,
+    //cost: AccountingType,
     prev_request_id: Option<RequestId>,
 }
 
@@ -47,10 +54,13 @@ impl<'r, 's> Segmentation<'r, 's> for NArraySegmentation<'r, 's> {
         let dimension: Vec<usize> = schema.attributes.iter().map(|attr| attr.len()).collect();
         let dimension = Dimension::new(&dimension);
 
+
         // calculate requested budget
         let block = VirtualBlockRequested::new(schema);
         let mut requested_budget = narray::build(&dimension, block);
         calculate_requested_budget(&request_batch, &mut requested_budget, schema);
+
+        println!("  requested_budget.size()={:?}", requested_budget.size());
 
         NArraySegmentation {
             dimension,
@@ -60,44 +70,245 @@ impl<'r, 's> Segmentation<'r, 's> for NArraySegmentation<'r, 's> {
         }
     }
 
+    fn new_cache(&self) -> NArrayCache {
+        let budget = VirtualBlockBudget {
+            budget: None,
+            prev_request_id: None,
+        };
+        (HashSet::new(), narray::build(&self.dimension, budget))
+    }
+
     fn compute_block_constraints<M: SegmentBudget>(
         &self,
         request_history: Vec<&Request>,
-        initial_block_budget: &AccountingType,
+        block: &Block,
+        narray_cache: Option<&mut NArrayCache>
     ) -> BlockConstraints<M> {
-        // calculate remaining budget
-        let budget = VirtualBlockBudget {
-            budget: initial_block_budget.clone(),
-            prev_request_id: None,
+
+        // feature flag by env var
+        // let cache_requests = std::env::var("CACHE_REQUEST_COST").unwrap_or("0".to_string());
+
+        let mut runtime_measurements: Vec<RuntimeMeasurement> = Vec::new();
+
+        let mut remaining_budget: NArray<VirtualBlockBudget> = if let Some(narray_cache) = narray_cache {
+            // let tmp_dir = std::env::temp_dir();
+            // if !tmp_dir.exists() {
+            //     fs::create_dir_all(&tmp_dir).expect("Failed to create temp directory");
+            // }
+            // let blkid = block.id;
+            // let tmp_file_path = tmp_dir.join(format!("cum_request_cost_{blkid}.bin"));
+            // let mut file = File::open(&tmp_file_path);
+            // println!("Cache file {:?}", &tmp_file_path);
+
+            // if file.is_ok() {
+            //     println!("Cache file size: {:?}", file.as_ref().unwrap().metadata().unwrap().len());
+            // }
+            //
+            // let budget = VirtualBlockBudget {
+            //     budget: None,
+            //     prev_request_id: None,
+            // };
+            // let config = config::standard();
+            //
+
+            let mut rm_loadcache = RuntimeMeasurement::start(RuntimeKind::LoadCache);
+
+
+            let (ref mut applied_requests, ref mut cum_request_cost) = narray_cache;
+            // Load from disk
+            // let (mut applied_requests, mut cum_request_cost): (HashSet<RequestId>, NArray<VirtualBlockBudget>) = if file.is_ok() {
+            //     bincode::decode_from_std_read(&mut file.unwrap(), config).expect("Failed to read cache file")
+            //     // bincode::deserialize_from(file.unwrap()).expect("Failed to read cache file")
+            // } else {
+            //     println!("Initializing new narray");
+            //     (HashSet::new(), narray::build(&self.dimension, budget))
+            // };
+            runtime_measurements.push(rm_loadcache.stop());
+
+            println!("  cum_request_cost.size()={:?}", cum_request_cost.size());
+
+            let mut rt_apply = RuntimeMeasurement::start(RuntimeKind::ApplyHistory);
+            // Update cum_request_cost with request history
+            let mut apply_count = 0;
+            for request in request_history.iter() {
+                let request = *request;
+                if !applied_requests.contains(&request.request_id) {
+                    for vec in request.dnf().repeating_iter(self.schema) {
+                        let idx = Index::new(&vec);
+                        cum_request_cost.update(&idx, request, |vblock, request| {
+                            vblock.add(request.request_id, request.request_cost(&block.privacy_unit));
+                        });
+                        apply_count += 1;
+                    }
+                    applied_requests.insert(request.request_id);
+                }
+            }
+            runtime_measurements.push(rt_apply.stop());
+            println!("Applied {} requests", apply_count);
+            // assert we have applied all requests in request_history by comparing all keys in the sets
+            // assert!(request_history.iter().map(|r| r.request_id).collect::<HashSet<_>>() == applied_requests., "Not all requests were applied");
+
+
+            println!("Applied last round's history");
+
+            let mut rt_save = RuntimeMeasurement::start(RuntimeKind::SaveCache);
+            // Save to disk or clone
+            // let mut file = File::create(&tmp_file_path).expect("Failed to create cache file");
+            // bincode::serialize_into(file, &(applied_requests.clone(), &cum_request_cost)).expect("Failed to write cache file");
+            // bincode::encode_into_std_write(&(applied_requests.clone(), &cum_request_cost), &mut file, config).expect("Failed to write cache file");
+
+            runtime_measurements.push(rt_save.stop());
+            // println!("Saved cache file");
+
+            let mut rt_apply_budget = RuntimeMeasurement::start(RuntimeKind::ApplyBudget);
+            // Apply budget on cum_request_cost -> remaining budget
+            // We re-use the memory for cum_request_cost as remaining_budget
+            let mut remaining_budget = cum_request_cost.clone();
+
+            let update_budget = |vblock: &mut VirtualBlockBudget, budget: &AccountingType| {
+                // assert!(vblock.budget.as_ref().unwrap().approx_eq(budget, F64Margin::default()), "Two different budgets for the same virtual block");
+                // let tmp = vblock.budget.clone().expect("Block doesnt have budget!");
+                // vblock.budget = Some(budget.clone());
+                // vblock.update(RequestId(0), &tmp); // subtracts budget from cum_request_cost
+
+
+                let cur_budget = vblock.budget.as_ref();
+                if cur_budget.is_none() {
+                    vblock.budget = Some(budget.clone());
+                } else {
+                    vblock.budget =  Some(budget - cur_budget.unwrap());
+                    if vblock.prev_request_id.is_none() {
+                        panic!("A block cannot have been selected by no request yet still have a budget. \
+                        This probably means its being visited twice!");
+                    }
+                }
+                vblock.prev_request_id = None;
+                // TODO: For correctness, ist here a risk we repeat this? --> What does repeating_iter do?
+            };
+            block.budget_by_section.iter().for_each(|section| {
+                for virtual_block_id in section.dnf().repeating_iter(self.schema) {
+                    let idx = Index::new(&virtual_block_id);
+                    remaining_budget.update(&idx, &section.unlocked_budget, update_budget);
+                }
+            });
+            runtime_measurements.push(rt_apply_budget.stop());
+
+            println!("Updated budget by section");
+
+            remaining_budget
+        } else {
+
+
+            // ==== OLD ====
+            let budget = match &block.default_unlocked_budget {
+                Some(budget) => {
+                    VirtualBlockBudget {
+                        budget: Some(budget.clone()),
+                        prev_request_id: None,
+                    }
+                }
+                None => {
+                    VirtualBlockBudget {
+                        budget: None,
+                        prev_request_id: None,
+                    }
+                }
+            };
+
+            // TODO [nku] [later]: as alternative could also remove cost / budget from virtualblock and only focus on hash id.
+            // afterwards, compute unique hash id and reverse all, then compute for each id cost.
+            // also for request history could do this segmentation with hash id.
+            // (would potentially save a lot of duplicated computation on adding up accounting_types)
+
+            // Start with default budget for each block
+            let mut remaining_budget = narray::build(&self.dimension, budget);
+
+            // Set custom budget from budget_by_section
+            let update_budget = |vblock: &mut VirtualBlockBudget, budget: &AccountingType| {
+                assert!(vblock.budget.is_none() || vblock.budget.as_ref().unwrap().approx_eq(budget, F64Margin::default()), "Two different budgets for the same virtual block");
+                vblock.budget = Some(budget.clone());
+            };
+
+            let mut rt_apply = RuntimeMeasurement::start(RuntimeKind::ApplyBudget);
+
+            block.budget_by_section.iter().for_each(|section| {
+                for virtual_block_id in section.dnf().repeating_iter(self.schema) {
+                    let idx = Index::new(&virtual_block_id);
+                    remaining_budget.update(&idx, &section.unlocked_budget, update_budget);
+                }
+            });
+            runtime_measurements.push(rt_apply.stop());
+            // TODO [hly]: The post segmentation time of the first round should tell you how long the above budget setting code takes.
+
+            // TODO [hly]: We could keep a cache of <Set<RequestId>, NArray<AccountingType>> for the cum_request_cost
+            //   1. Update the cum_request_cost with the request history (essentially applying the costs of the prev round)
+            //   2. There are two options based on how much you want to keep in memory:
+            //         2.1 Saving Memory:   (requires keeping 2 NArrays in memory and write one to disk)
+            //              - You write the cum_request_cost to disk after this update again.
+            //              - Writing to disk can be optional, you can just clone it and work on the clone.
+            //              - You apply the budget on the "cum_request_cost" itself: value = budget - cum_request_cost
+            //              - This now becomes the "remaining_budget"
+            //         2.2 Ignoring Memory: (requires keeping 3 NArrays in memory)
+            //              - You compute the "budget" ("remaining_budget" called above) with the code above.
+            //              - In `calculate_remaining_budget_per_segment(..)` you pass in 3x an narray: cum_request_cost, requested_budget, available_budget (prev name: remaining_budget)
+            //              - You iterate over the `requested_budget` array as currently, and then you get an idx. With this idx you lookup the cum_request_cost and the available_budget and "update" the segment with the difference.
+
+            let mut rt_history = RuntimeMeasurement::start(RuntimeKind::ApplyHistory);
+            calculate_remaining_budget(&request_history, &mut remaining_budget, block, self.schema);
+            runtime_measurements.push(rt_history.stop());
+
+            remaining_budget
         };
 
-        // TODO [nku] [later]: as alternative could also remove cost / budget from virtualblock and only focus on hash id.
-        // afterwards, compute unique hash id and reverse all, then compute for each id cost.
-        // also for request history could do this segmentation with hash id.
-        // (would potentially save a lot of duplicated computation on adding up accounting_types)
-
-        let mut remaining_budget = narray::build(&self.dimension, budget);
-        calculate_remaining_budget(&request_history, &mut remaining_budget, self.schema);
-
         // calculate min remaining budget per segment
-        // TODO [nku][later] old hash function with xor of request ids combined in a tuple  -> or xor of requestids and hash value
+        let default_budget = match &block.default_unlocked_budget {
+            Some(budget) => {
+                VirtualBlockBudget {
+                    budget: Some(budget.clone()),
+                    prev_request_id: None,
+                }
+            }
+            None => {
+                VirtualBlockBudget {
+                    budget: None,
+                    prev_request_id: None,
+                }
+            }
+        };
+
+        let mut rt_segment = RuntimeMeasurement::start(RuntimeKind::CalculateBySegment);
+        // TODO: Are negative budgets considered properly in the rdp_opt_budget consolidation?
         let mut budget_by_segment: HashMap<u64, SegmentWrapper<M>> = HashMap::new();
         calculate_remaining_budget_per_segment(
             &mut budget_by_segment,
             &remaining_budget,
             &self.requested_budget,
+            &default_budget,
         );
+        runtime_measurements.push(rt_segment.stop());
+
+        // print runtime_measurements
+        for rm in runtime_measurements.iter() {
+            println!("{:?}", rm);
+        }
+
+        // TODO [nku]: Ideally this selection should happen outside of the composition
+        let selected_requests: Vec<&Request> = self.request_batch.iter().filter(|req| is_selected_block(req, block)).map(|r| *r).collect();
+
+
+
+        // reconstruct request ids from segment id with first_index
+        reconstruct_request_ids(&mut budget_by_segment, &selected_requests, block);
+
 
         budget_by_segment.retain(|_, v| v.is_contested());
 
-        // reconstruct request ids from segment id with first_index
-        reconstruct_request_ids(&mut budget_by_segment, &self.request_batch);
 
         // find rejected request ids (r.cost > budget)
         //  + remove cost of rejected request ids from cost sums
         //  + retain only congested (after subtraction of rejected requests)
         let rejected_request_ids =
-            reject_infeasible_requests(&mut budget_by_segment, &self.request_batch);
+            reject_infeasible_requests(&mut budget_by_segment, &self.request_batch, block);
 
         // find accepted (all \ rejected \ congested)
         build_block_constraints(
@@ -111,12 +322,18 @@ impl<'r, 's> Segmentation<'r, 's> for NArraySegmentation<'r, 's> {
 fn calculate_remaining_budget(
     request_history: &[&Request],
     remaining_budget: &mut NArray<VirtualBlockBudget>,
+    block: &Block,
     schema: &Schema,
 ) {
     let update_budget_closure = |virtual_block_budget: &mut VirtualBlockBudget,
                                  request: &Request| {
-        virtual_block_budget.update(request.request_id, &request.request_cost);
+        virtual_block_budget.update(request.request_id, request.request_cost(&block.privacy_unit));
     };
+
+    // TODO [hly]: I think here it's possible to have a set of request ids associated with the "cached" cum_request_cost.
+    //             Then based on the request history you are getting, you can check which request costs you still need to add to the cum_request_cost.
+    //              (Plus maybe also check that there are no additional request ids that are not part of the history accumulated in the cum_request_cost)
+    // Set<RequestId>     cum_request_cost: NArray<...>
 
     for request in request_history.iter() {
         let request = *request;
@@ -133,7 +350,7 @@ fn calculate_requested_budget(
     schema: &Schema,
 ) {
     let update_virtual_block = |block: &mut VirtualBlockRequested, request: &Request| {
-        block.update(request.request_id, &request.request_cost);
+        block.update(request.request_id);
     };
 
     for request in request_batch.iter() {
@@ -143,6 +360,68 @@ fn calculate_requested_budget(
             requested_budget.update(&idx, request, update_virtual_block);
         }
     }
+}
+
+
+pub trait AdpCost {
+    fn compute_idx_per_segment(&self) -> HashMap<u64, Index>;
+    fn max_adp_cost(&self, segments: &HashMap<u64, Index>, relevant_requests: Vec<&Request>, privacy_unit: PrivacyUnit, alphas: &RdpAlphas, delta: f64) -> AccountingType;
+}
+
+impl AdpCost for NArraySegmentation<'_, '_>{
+
+    fn compute_idx_per_segment(&self) -> HashMap<u64, Index>{
+        let mut segments = HashMap::new();
+        for (i, virtual_block_requested_cost) in self.requested_budget.iter().enumerate() {
+            segments
+                .entry(virtual_block_requested_cost.request_hash)
+                .or_insert_with(|| {
+                        narray::from_idx(i, &self.requested_budget.dim)
+                });
+        }
+        println!("  n_segments={:?}", segments.len());
+        segments
+    }
+
+
+    fn max_adp_cost(&self, segments: &HashMap<u64, Index>, relevant_requests: Vec<&Request>, privacy_unit: PrivacyUnit, alphas: &RdpAlphas, delta: f64) -> AccountingType {
+
+        let budget_type = AccountingType::zero_clone(&self.schema.accounting_type);
+
+        let max_epsilon = segments.iter().map(|(_id, first_idx)| {
+
+            // reconstruct request ids from segment with first_index and sum up their costs
+            let (_request_ids, sum_requested_cost) = relevant_requests
+                .iter()
+                .filter(|r| {
+                    // keep only requests which have one co ·─łnjunction that contains the first_idx
+                    r.dnf()
+                        .conjunctions
+                        .iter()
+                        .any(|conj| conj.contains(first_idx))
+                })
+                .map(|r| (r.request_id, r.request_cost(&privacy_unit)))
+                .fold((Vec::new(), budget_type.clone()), |(mut ids, mut sum), (id, cost)| {
+                    ids.push(id);
+                    sum += cost;
+                    (ids, sum)
+                });
+
+            let adp = sum_requested_cost.rdp_to_adp(alphas, delta);
+
+            let epsilon = match adp {
+                AccountingType::EpsDeltaDp { eps , delta: _} => {
+                    eps
+                }
+                _ => panic!("Must be EpsDeltaDp")
+
+            };
+            epsilon
+        }).max_by(|x, y| x.partial_cmp(y).unwrap());
+
+        AccountingType::EpsDeltaDp { eps: max_epsilon.unwrap() , delta}
+    }
+
 }
 
 // could be alternative approach for "calculate_remaining_budget_per_segment"
@@ -188,6 +467,7 @@ fn calculate_remaining_budget_per_segment<M: SegmentBudget>(
     budget_by_segment: &mut HashMap<u64, SegmentWrapper<M>>,
     remaining_budget: &NArray<VirtualBlockBudget>,
     requested_budget: &NArray<VirtualBlockRequested>,
+    default_budget: &VirtualBlockBudget
 ) {
     for (i, virtual_block_requested_cost) in requested_budget.iter().enumerate() {
         let virtual_block_budget = remaining_budget.get_by_flat(i);
@@ -200,7 +480,7 @@ fn calculate_remaining_budget_per_segment<M: SegmentBudget>(
                     narray::from_idx(i, &requested_budget.dim),
                 )
             })
-            .update_segment(virtual_block_budget, virtual_block_requested_cost);
+            .update_segment(virtual_block_budget, virtual_block_requested_cost, default_budget);
     }
 }
 
@@ -230,33 +510,48 @@ impl Contains for Conjunction {
 fn reconstruct_request_ids<M: SegmentBudget>(
     segments: &mut HashMap<u64, SegmentWrapper<M>>,
     requests: &[&Request],
+    block: &Block,
 ) {
+
+    let budget_type = match &block.default_total_budget {
+        Some(budget) => AccountingType::zero_clone(budget),
+        None =>  AccountingType::zero_clone(&block.budget_by_section.iter().next().unwrap().total_budget),
+    };
+
     for (_id, segment_wrapper) in segments.iter_mut() {
         let first_idx = &segment_wrapper.first_idx;
 
-        segment_wrapper.segment.request_ids = Some(
-            requests
-                .iter()
-                .filter(|r| {
-                    // keep only requests which have one conjunction that contains the first_idx
-                    r.dnf()
-                        .conjunctions
-                        .iter()
-                        .any(|conj| conj.contains(first_idx))
-                })
-                .map(|r| r.request_id)
-                .collect(),
-        );
+        let (request_ids, sum_requested_cost) = requests
+            .iter()
+            .filter(|r| {
+                // keep only requests which have one conjunction that contains the first_idx
+                r.dnf()
+                    .conjunctions
+                    .iter()
+                    .any(|conj| conj.contains(first_idx))
+            })
+            .map(|r| (r.request_id, r.request_cost(&block.privacy_unit)))
+            .fold((Vec::new(), budget_type.clone()), |(mut ids, mut sum), (id, cost)| {
+                ids.push(id);
+                sum += cost;
+                (ids, sum)
+            });
+
+
+        segment_wrapper.sum_requested_cost = Some(sum_requested_cost);
+        segment_wrapper.segment.request_ids = Some(request_ids);
+
     }
 }
 
 fn reject_infeasible_requests<M: SegmentBudget>(
     segments: &mut HashMap<u64, SegmentWrapper<M>>,
     requests: &[&Request],
+    block: &Block,
 ) -> HashSet<RequestId> {
     let request_cost_map: HashMap<RequestId, &AccountingType> = requests
         .iter()
-        .map(|r| (r.request_id, &r.request_cost))
+        .map(|r| (r.request_id, r.request_cost(&block.privacy_unit)))
         .collect();
 
     let mut rejected_request_ids: HashSet<RequestId> = HashSet::new();
@@ -406,24 +701,47 @@ impl VirtualBlockBudget {
             _ => {
                 // subtract the privacy cost from the budget and update request id to ensure that we only do it once
                 self.prev_request_id = Some(request_id);
-                self.budget -= privacy_cost
+                //let mut cur_budget = self.budget.expect("budget must be set before updating");
+
+                let cur_budget = self.budget.as_ref().expect("budget must be set before updating");
+                self.budget =  Some(cur_budget - privacy_cost);
             }
         }
+    }
+    fn add(&mut self, request_id: RequestId, privacy_cost: &AccountingType) {
+        match self.prev_request_id {
+            Some(prev_request_id) if prev_request_id == request_id => (), // do nothing
+            // ignore (because we use repeating iter -> can happen that we select same block twice)
+            _ => {
+                // subtract the privacy cost from the budget and update request id to ensure that we only do it once
+                self.prev_request_id = Some(request_id);
+
+                // Init at zero
+                let cur_budget = self.budget.as_ref();
+                if let Some(cur_budget) = cur_budget {
+                    self.budget =  Some(cur_budget + privacy_cost);
+                } else {
+                    self.budget = Some(privacy_cost.clone());
+                }
+            }
+        }
+    }
+    fn is_budget_applied(&self) -> bool {
+        self.prev_request_id.is_none() && self.budget.is_some()
     }
 }
 
 // TODO [nku] [later]: The hash function is not the bottleneck -> with a better hash function we can ignore request_count logic
 impl VirtualBlockRequested {
-    fn new(schema: &Schema) -> VirtualBlockRequested {
+    fn new(_schema: &Schema) -> VirtualBlockRequested {
         VirtualBlockRequested {
             request_hash: 0,
             request_count: 0,
-            cost: AccountingType::zero_clone(&schema.accounting_type),
             prev_request_id: None,
         }
     }
 
-    fn update(&mut self, request_id: RequestId, privacy_cost: &AccountingType) {
+    fn update(&mut self, request_id: RequestId) {
         match self.prev_request_id {
             Some(prev_request_id) if prev_request_id == request_id => (), // do nothing if prev request id is the same (deal with repeating iter)
             _ => {
@@ -436,7 +754,6 @@ impl VirtualBlockRequested {
                 );
 
                 self.request_count += 1;
-                self.cost += privacy_cost;
                 self.prev_request_id = Some(request_id);
             }
         }
@@ -465,10 +782,18 @@ impl<M: SegmentBudget> SegmentWrapper<M> {
         &mut self,
         virtual_block_budget: &VirtualBlockBudget,
         virtual_block_requested_cost: &VirtualBlockRequested,
+        default_budget: &VirtualBlockBudget,
     ) {
-        self.segment
-            .remaining_budget
-            .add_budget_constraint(&virtual_block_budget.budget);
+        // TODO: Discuss this logic
+        if virtual_block_budget.budget.is_some() {
+            self.segment
+                .remaining_budget
+                .add_budget_constraint(virtual_block_budget.budget.as_ref().expect("budget must be set"));
+        } else {
+            self.segment
+                .remaining_budget
+                .add_budget_constraint(default_budget.budget.as_ref().expect("default budget must be set"));
+        }
 
         // 5914157414052549729
 
@@ -482,21 +807,22 @@ impl<M: SegmentBudget> SegmentWrapper<M> {
             } // TODO [nku] [later] want some assert which is not present in --release
         }
 
-        match &self.sum_requested_cost {
-            // set the cost if not set previously
-            None => self.sum_requested_cost = Some(virtual_block_requested_cost.cost.clone()),
-
-            // assert that cost is the same for all blocks in segment
-            Some(sum_requested_cost) => assert!(
-                sum_requested_cost
-                    .approx_eq(&virtual_block_requested_cost.cost, F64Margin::default()),
-                "segment_id={}     my_sum={:?}  other_sum={:?}",
-                self.segment.id,
-                sum_requested_cost,
-                virtual_block_requested_cost.cost
-            ),
-            // TODO [nku] [later] want some assert which is not present in --release
-        }
+        // -> removed because we now only sum up the costs after reconstructing the request ids
+//        match &self.sum_requested_cost {
+//            // set the cost if not set previously
+//            None => self.sum_requested_cost = Some(virtual_block_requested_cost.cost.clone()),
+//
+//            // assert that cost is the same for all blocks in segment
+//            Some(sum_requested_cost) => assert!(
+//                sum_requested_cost
+//                    .approx_eq(&virtual_block_requested_cost.cost, F64Margin::default()),
+//                "segment_id={}     my_sum={:?}  other_sum={:?}",
+//                self.segment.id,
+//                sum_requested_cost,
+//                virtual_block_requested_cost.cost
+//            ),
+//            // TODO [nku] [later] want some assert which is not present in --release
+//        }
     }
 
     fn is_contested(&self) -> bool {

@@ -6,7 +6,9 @@ mod knapsack;
 use crate::block::Block;
 use crate::composition::{CompositionConstraint, ProblemFormulation, StatusResult};
 use crate::dprivacy::budget::SegmentBudget;
+use crate::dprivacy::privacy_unit::{is_selected_block, PrivacyUnit};
 use std::cmp::Ordering;
+use std::time::Instant;
 
 use crate::schema::Schema;
 
@@ -23,13 +25,14 @@ use crate::dprivacy::{AlphaIndex, RdpAccounting};
 use crate::logging::{DpfStats, RuntimeKind, RuntimeMeasurement};
 use crate::AccountingType;
 use itertools::Itertools;
-use rand::prelude::IteratorRandom;
+use log::info;
+// use rand::prelude::IteratorRandom;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ops::Deref;
-
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+use crate::composition::block_composition_pa::NArrayCache;
 use super::ResourceAllocation;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -51,7 +54,7 @@ pub struct EfficiencyBased {
     request_cache: HashMap<RequestId, HashSet<BlockId>>,
 
     /// The rng used to decide the random assignment of blocks to requests
-    rng: StdRng,
+    _rng: StdRng,
 
     algo: EfficiencyBasedAlgo,
 }
@@ -72,52 +75,76 @@ impl EfficiencyBased {
         }
         EfficiencyBased {
             request_cache: HashMap::new(),
-            rng: StdRng::seed_from_u64(seed),
+            _rng: StdRng::seed_from_u64(seed),
             algo,
         }
     }
 
     pub fn round<M: SegmentBudget>(
         &mut self,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &mut BTreeMap<RequestId, Request>,
         request_history: &HashMap<RequestId, Request>,
         available_blocks: &HashMap<BlockId, Block>,
         schema: &Schema,
         block_comp_wrapper: &BlockCompWrapper,
         runtime_measurements: &mut Vec<RuntimeMeasurement>,
+        block_narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>>
     ) -> (ResourceAllocation, AllocationStatus) {
+
+        // ensure that the request cache is up to date -> select blocks based on privacy unit selection
+        self.request_cache.clear();
+
+
+        // NOTE: AT the moment, we are doing this request-block filtering twice.
+        //         (1) in the problem formulation   (2) here
+        for (rid, request) in candidate_requests.iter_mut() {
+            let block_ids: HashSet<BlockId> = available_blocks
+                .iter()
+                .filter_map(|(bid, block)| match is_selected_block(request, block) {
+                    true => Some(*bid),
+                    false => None,
+                })
+                .collect();
+
+            assert!(
+                request.num_blocks.is_none(),
+                "Request should not have num_blocks set yet"
+            );
+
+            request.num_blocks = Some(block_ids.len());
+
+            self.request_cache.insert(*rid, block_ids);
+        }
+
+
+
+        let n_virtual_blocks: usize = schema.attributes.iter().map(|attr| attr.len()).product();
+        info!("Building problem formulation...\n   (n_candidate_requests={:?}  n_available_blocks={:?}  n_virtual_blocks={:?})", candidate_requests.len(), available_blocks.len(), n_virtual_blocks);
+        let time = Instant::now();
+
         // build problem formulation
-        // TODO: Could choose blocks before building problem formulation and take this into account when building the problem formulation
         let mut pf: ProblemFormulation<M> = block_comp_wrapper.build_problem_formulation::<M>(
             available_blocks,
             candidate_requests,
             request_history,
             schema,
             runtime_measurements,
+            block_narray_cache,
         );
 
         let num_contested_segments_initially = pf.contested_constraints().count();
 
+        let elapsed_s = time.elapsed().as_millis() / 1000;
+
+        info!("Building problem formulation -> done in {:?} sec!  n_contested_segments={:?}", elapsed_s, num_contested_segments_initially);
+
         let mut alloc_meas = RuntimeMeasurement::start(RuntimeKind::RunAllocationAlgorithm);
 
-        // for each new candidate request, we randomly select blocks which we want to allocate
-        for (rid, request) in candidate_requests.iter() {
-            if !self.request_cache.contains_key(rid) {
-                assert!(
-                    available_blocks.len() >= request.n_users,
-                    "Not enough blocks to fulfill request"
-                );
-                self.request_cache.insert(
-                    *rid,
-                    HashSet::from_iter(
-                        available_blocks
-                            .keys()
-                            .copied()
-                            .choose_multiple(&mut self.rng, request.n_users),
-                    ),
-                );
-            }
-        }
+
+
+
+        info!("Calculate DPK efficiency scores to rank requests...");
+        let time = Instant::now();
 
         // calculate efficiency score for each request if there any contested segments,
         // depending on the chosen algo
@@ -134,6 +161,8 @@ impl EfficiencyBased {
                 }
             }
         };
+        let elapsed_s = time.elapsed().as_millis() / 1000;
+        info!("Calculate DPK efficiency scores -> done in {:?} sec!", elapsed_s);
 
         // sort candidate requests based on their efficiency
         let sorted_candidates: Vec<RequestId> = candidate_requests
@@ -164,6 +193,10 @@ impl EfficiencyBased {
             accepted: HashMap::new(),
             rejected: HashSet::new(),
         };
+
+        info!("Allocate requests in order of efficiency...");
+        let time = Instant::now();
+
 
         // try to allocate requests greedily
         for rid in sorted_candidates {
@@ -199,6 +232,9 @@ impl EfficiencyBased {
             }
         }
 
+        let elapsed_s = time.elapsed().as_millis() / 1000;
+        info!("Allocate requests -> done in {:?} sec!", elapsed_s);
+
         runtime_measurements.push(alloc_meas.stop());
 
         (
@@ -216,7 +252,7 @@ impl EfficiencyBased {
     /// If a different efficiency score is desired, this function can be replaced.
     fn calculate_dpk_efficiency<M: SegmentBudget>(
         &self,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &BTreeMap<RequestId, Request>,
         eta: f64,
         solver: KPSolverType,
         pf: &ProblemFormulation<M>,
@@ -226,6 +262,8 @@ impl EfficiencyBased {
             best_alphas_and_capacities
                 .into_iter()
                 .flat_map(|(segment_id, (alpha_index, capacity))| {
+                    let privacy_unit: &PrivacyUnit = pf.get_block_privacy_unit(segment_id.block_id);
+
                     // compute dij / cj for each segment for each request (if that request applies to the segment)
                     segment_id
                         .segment
@@ -240,7 +278,7 @@ impl EfficiencyBased {
                             let request_cost = candidate_requests
                                 .get(rid)
                                 .unwrap()
-                                .request_cost
+                                .request_cost(privacy_unit)
                                 .get_value_for_alpha(alpha_index);
                             (*rid, request_cost / capacity)
                         })
@@ -271,7 +309,7 @@ impl EfficiencyBased {
     /// * `pf` - The problem formulation which contains the contested constraints
     fn calc_best_alphas<M: SegmentBudget>(
         &self,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &BTreeMap<RequestId, Request>,
         eta: f64,
         solver: KPSolverType,
         pf: &ProblemFormulation<M>,
@@ -299,7 +337,6 @@ impl EfficiencyBased {
                 constraints
                     .first()
                     .expect("no budget constraints in segment")
-                    .deref()
                     .get_alpha_indices()
             })
             .expect("No contested segments");
@@ -325,6 +362,9 @@ impl EfficiencyBased {
                     .into_par_iter()
                     .map(|(segment_id, constraints)| {
                         // for each segment, we determine the best alpha by solving 1d knapsack (approximately)
+
+                        let privacy_unit: &PrivacyUnit =
+                            pf.get_block_privacy_unit(segment_id.block_id);
 
                         // get the requests that apply to this segment
                         let requests: Vec<_> = segment_id
@@ -360,40 +400,46 @@ impl EfficiencyBased {
                                         .expect("no budget constraints in segment")
                                         .max(0.0);
 
-                                    // Each request is an allocation item with weight equal to the cost of the request
-                                    // in the knapsack problem
-                                    let items: Vec<KPItem> = requests
-                                        .iter()
-                                        .map(|r| KPItem {
-                                            id: r.request_id.into(),
-                                            weight: r
-                                                .request_cost
-                                                .get_value_for_alpha(*alpha_index),
-                                            profit: r.profit as f64,
-                                        })
-                                        .collect::<Vec<_>>();
+                                    if capacity > 0.0 {
+                                        // Each request is an allocation item with weight equal to the cost of the request
+                                        // in the knapsack problem
+                                        let items: Vec<KPItem> = requests
+                                            .iter()
+                                            .map(|r| KPItem {
+                                                id: r.request_id.into(),
+                                                weight: r
+                                                    .request_cost(privacy_unit)
+                                                    .get_value_for_alpha(*alpha_index),
+                                                profit: r.profit as f64,
+                                            })
+                                            .collect::<Vec<_>>();
 
-                                    // run the 1d knapsack solver
-                                    let kp_sol = match solver {
-                                        KPSolverType::Gurobi => GurobiKPSolver {}
-                                            .preprocess_and_solve(
-                                                items,
-                                                capacity,
-                                                1.0 - 2.0 * eta / 3.0,
-                                            ),
-                                        KPSolverType::FPTAS => HepsFPTASKPSolver {}
-                                            .preprocess_and_solve(
-                                                items,
-                                                capacity,
-                                                1.0 - 2.0 * eta / 3.0,
-                                            ),
-                                    };
+                                        // run the 1d knapsack solver
+                                        let kp_sol = match solver {
+                                            KPSolverType::Gurobi => GurobiKPSolver {}
+                                                .preprocess_and_solve(
+                                                    items,
+                                                    capacity,
+                                                    1.0 - 2.0 * eta / 3.0,
+                                                ),
+                                            KPSolverType::FPTAS => HepsFPTASKPSolver {}
+                                                .preprocess_and_solve(
+                                                    items,
+                                                    capacity,
+                                                    1.0 - 2.0 * eta / 3.0,
+                                                ),
+                                        };
 
-                                    // profit using this alpha index
-                                    let index_profit =
-                                        kp_sol.into_iter().map(|i| i.profit).sum::<f64>();
+                                        // profit using this alpha index
+                                        let index_profit =
+                                            kp_sol.into_iter().map(|i| i.profit).sum::<f64>();
 
-                                    (*alpha_index, index_profit, capacity)
+                                        (*alpha_index, index_profit, capacity)
+                                    } else {
+                                        // if knapsack capacity is 0, we cannot allocate any requests -> profit is 0
+                                        let index_profit = 0.0;
+                                        (*alpha_index, index_profit, capacity)
+                                    }
                                 })
                                 .max_by(|(_, a, _), (_, b, _)| a.partial_cmp(b).unwrap())
                                 .map(|(alpha_index, _, capacity)| (alpha_index, capacity))
@@ -409,13 +455,13 @@ impl EfficiencyBased {
 mod tests {
     use crate::allocation::efficiency_based::{EfficiencyBased, KPSolverType, SegmentId};
     use crate::allocation::BlockCompWrapper;
-    use crate::block::BlockId::User;
     use crate::block::{Block, BlockId};
     use crate::composition::{
         block_composition, block_composition_pa, CompositionConstraint, ProblemFormulation,
     };
     use crate::config::{EfficiencyBasedAlgo, SegmentationAlgo};
     use crate::dprivacy::budget::OptimalBudget;
+    use crate::dprivacy::privacy_unit::PrivacyUnit;
     use crate::dprivacy::rdp_alphas_accounting::RdpAlphas::A3;
     use crate::dprivacy::AccountingType::Rdp;
     use crate::dprivacy::{AccountingType, AlphaIndex};
@@ -436,16 +482,16 @@ mod tests {
         let n_blocks = 100;
 
         let block_comp_wrapper = BlockCompWrapper::BlockCompositionPartAttributesVariant(
-            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray),
+            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray, None),
         );
 
-        let (_bids, candidate_requests, _pf, mut dpk, schema, blocks) =
+        let (_bids, mut candidate_requests, _pf, mut dpk, schema, blocks) =
             setup_dpk_test_no_pa(n_blocks);
         // println!("block len: {}", blocks.len());
 
         let resource_allocation = dpk
             .round::<OptimalBudget>(
-                &candidate_requests,
+                &mut candidate_requests,
                 &HashMap::new(),
                 &blocks,
                 &schema,
@@ -481,16 +527,16 @@ mod tests {
         let n_blocks = 100;
 
         let block_comp_wrapper = BlockCompWrapper::BlockCompositionPartAttributesVariant(
-            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray),
+            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray, None),
         );
 
-        let (_bids, candidate_requests, _pf, mut dpk, schema, blocks) =
+        let (_bids, mut candidate_requests, _pf, mut dpk, schema, blocks) =
             setup_dpk_test_with_pa(n_blocks);
         // println!("block len: {}", blocks.len());
 
         let resource_allocation = dpk
             .round::<OptimalBudget>(
-                &candidate_requests,
+                &mut candidate_requests,
                 &HashMap::new(),
                 &blocks,
                 &schema,
@@ -709,14 +755,14 @@ mod tests {
             eps_values: A3([1.05, 1.1, 1.15]),
         };
 
-        let bids = HashSet::from_iter((0..n_blocks).map(User));
+        let bids = HashSet::from_iter((0..n_blocks).map(BlockId));
 
         let schema = build_dummy_schema(rdp_budget.clone());
         let mut candidate_requests = build_dummy_requests_with_pa(&schema, 100, rdp_0.clone(), 7);
         let request_history = HashMap::new();
-        let blocks = generate_blocks(0, n_blocks, rdp_budget);
+        let blocks = generate_blocks(0, n_blocks, rdp_budget.clone(), rdp_budget);
         let block_comp_wrapper = BlockCompWrapper::BlockCompositionPartAttributesVariant(
-            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray),
+            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray, None),
         );
 
         // set custom request costs, which ensure that for each virtual block (identified by the
@@ -743,10 +789,12 @@ mod tests {
         // set request costs individually
         #[allow(clippy::if_same_then_else)]
         for request in candidate_requests.values_mut() {
-            request.request_cost = request_costs
+            let request_cost = request_costs
                 .get(&request.request_id)
                 .expect("request cost not found")
                 .clone();
+
+            request.set_request_cost(PrivacyUnit::User, request_cost);
             // set profit to prefer requests with higher id. Note that the property that more requests
             // is always better still holds, as we can allocate at most two requests per virtual block
             // and no single request has more >= 200 profit
@@ -766,7 +814,7 @@ mod tests {
                 .values()
                 .map(|r| (r.request_id, bids.clone()))
                 .collect(),
-            rng: StdRng::seed_from_u64(42),
+            _rng: StdRng::seed_from_u64(42),
             algo: EfficiencyBasedAlgo::Dpk {
                 eta: 0.015,
                 kp_solver: KPSolverType::FPTAS,
@@ -801,12 +849,12 @@ mod tests {
             eps_values: A3([1.05, 1.1, 1.15]),
         };
 
-        let bids = HashSet::from_iter((0..n_blocks).map(User));
+        let bids = HashSet::from_iter((0..n_blocks).map(BlockId));
 
         let schema = build_dummy_schema(rdp_budget.clone());
         let mut candidate_requests = build_dummy_requests_no_pa(&schema, 100, rdp_0.clone(), 7);
         let request_history = HashMap::new();
-        let blocks = generate_blocks(0, n_blocks, rdp_budget);
+        let blocks = generate_blocks(0, n_blocks, rdp_budget.clone(), rdp_budget);
         let block_comp_wrapper =
             BlockCompWrapper::BlockCompositionVariant(block_composition::build_block_composition());
 
@@ -827,10 +875,12 @@ mod tests {
         // set request costs individually
         #[allow(clippy::if_same_then_else)]
         for request in candidate_requests.values_mut() {
-            request.request_cost = request_costs
+            let request_cost = request_costs
                 .get(&request.request_id)
                 .expect("request cost not found")
                 .clone();
+
+            request.set_request_cost(PrivacyUnit::User, request_cost);
             // set profit to prefer requests with higher id. Note that the property that more requests
             // is always better still holds, as we can allocate at most two requests per virtual block
             // and no single request has more >= 200 profit
@@ -850,7 +900,7 @@ mod tests {
                 .values()
                 .map(|r| (r.request_id, bids.clone()))
                 .collect(),
-            rng: StdRng::seed_from_u64(42),
+            _rng: StdRng::seed_from_u64(42),
             algo: EfficiencyBasedAlgo::Dpk {
                 eta: 0.015,
                 kp_solver: KPSolverType::FPTAS,

@@ -1,5 +1,6 @@
 [workspace]
 members = ["dp-planner"]
+resolver = "2"
 
 [profile.dev]    # In this profile, special assertions are run
 opt-level = 0    # no optimizations

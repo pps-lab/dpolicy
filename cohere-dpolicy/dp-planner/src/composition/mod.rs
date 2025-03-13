@@ -11,10 +11,10 @@
 
 use concurrent_queue::ConcurrentQueue;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-
+use std::sync::{Arc, RwLock};
 use itertools::{Either, Itertools};
 use petgraph::dot::Dot;
 use petgraph::graph::NodeIndex;
@@ -22,6 +22,8 @@ use petgraph::stable_graph::StableGraph;
 use petgraph::Undirected;
 use rayon::prelude::*;
 
+use crate::dprivacy::privacy_unit::PrivacyUnit;
+use crate::dprivacy::AccountingType;
 use crate::logging::RuntimeMeasurement;
 use crate::{
     block::{Block, BlockId},
@@ -29,6 +31,7 @@ use crate::{
     request::{Request, RequestId},
     schema::Schema,
 };
+use crate::composition::block_composition_pa::NArrayCache;
 
 pub mod block_composition;
 pub mod block_composition_pa;
@@ -39,6 +42,8 @@ pub struct ProblemFormulation<M: SegmentBudget> {
     graph: StableGraph<Node<M>, Edge, Undirected>,
 
     requests: HashMap<RequestId, HashSet<NodeIndex>>, //<RequestId, RequestBlockNode>
+
+    privacy_unit_lookup: HashMap<BlockId, PrivacyUnit>,
 }
 
 /// Return value of [ProblemFormulation::request_status()].
@@ -81,9 +86,11 @@ pub enum StatusResult {
 /// linked method
 pub struct AcceptableRequest {
     /// The id of the next acceptable request.
+    #[allow(dead_code)]
     pub(crate) request_id: RequestId,
     /// Which blocks are acceptable, i.e., there is enough budget for this request on that block
     /// regardless of other allocation decisions.
+    #[allow(dead_code)]
     pub(crate) acceptable: Vec<BlockId>,
 
     /// Which blocks are contested, i.e., this block may be allocated to the specified request,
@@ -146,10 +153,11 @@ pub trait CompositionConstraint {
     fn build_problem_formulation<M: SegmentBudget>(
         &self,
         blocks: &HashMap<BlockId, Block>,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &BTreeMap<RequestId, Request>,
         history_requests: &HashMap<RequestId, Request>,
         schema: &Schema,
         runtime_measurements: &mut Vec<RuntimeMeasurement>,
+        narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>>,
     ) -> ProblemFormulation<M>;
 }
 
@@ -165,7 +173,7 @@ enum Node<M: SegmentBudget> {
     },
     /// A node that corresponds to a segment of a block (without partitioning attributes, there
     /// is exactly one segment per node, else there may be multiple)
-    BlockSegmentConstraint { budget: M },
+    BlockSegmentConstraint { budget: M , privacy_unit: PrivacyUnit},
 }
 
 struct Edge {}
@@ -177,7 +185,7 @@ impl<M: SegmentBudget> fmt::Display for Node<M> {
                 request_id,
                 block_id,
             } => write!(f, "request: {}\nblock: {}", request_id, block_id),
-            Node::BlockSegmentConstraint { budget } => write!(f, "budget:\n{}", budget),
+            Node::BlockSegmentConstraint { budget , privacy_unit} => write!(f, "budget:\n{} \nunit: {}", budget, privacy_unit),
         }
     }
 }
@@ -245,11 +253,15 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
 
     pub(crate) fn new(
         mut block_constraints: HashMap<BlockId, BlockConstraints<M>>,
-        request_lookup: &HashMap<RequestId, Request>,
+        request_lookup: &BTreeMap<RequestId, Request>,
+        block_lookup: &HashMap<BlockId, Block>,
     ) -> Self {
+        let privacy_unit_lookup = block_lookup.iter().map(|(block_id, block)| (block_id.clone(), block.privacy_unit.clone())).collect();
+
         let mut pf = ProblemFormulation {
             graph: StableGraph::default(),
             requests: HashMap::new(),
+            privacy_unit_lookup: privacy_unit_lookup
         };
         // println!("bbbbb {:?}", block_constraints);
         for (block_id, constraint) in block_constraints.drain() {
@@ -264,11 +276,12 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
                 .iter()
                 .map(|request_id| (*request_id, pf.insert_request_block(*request_id, block_id)))
                 .collect();
-
+            let privacy_unit = &block_lookup.get(&block_id).expect("missing block").privacy_unit;
             for segment in constraint.contested_segments.into_iter() {
                 // insert node for each segment
                 let segment_idx = pf.graph.add_node(Node::BlockSegmentConstraint {
                     budget: segment.remaining_budget,
+                    privacy_unit: privacy_unit.clone(),
                 });
 
                 // add edges between segments and request_block nodes
@@ -282,11 +295,13 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
             }
         }
 
+        // TODO: CAN I KEEP THIS?
+
         //  eliminate requests which don't have sufficient number of blocks
         let request_block_idx_removal = pf
             .requests
             .iter()
-            .filter(|(request_id, blocks)| blocks.len() < request_lookup[request_id].n_users)
+            .filter(|(request_id, blocks)| blocks.len() < request_lookup[request_id].num_blocks.unwrap())
             .flat_map(|(_request_id, blocks)| blocks)
             .copied()
             .collect();
@@ -299,19 +314,23 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
         pf
     }
 
+    pub fn get_block_privacy_unit(&self, block_id: BlockId) -> &PrivacyUnit {
+        self.privacy_unit_lookup.get(&block_id).expect("missing block id")
+    }
+
     pub fn allocate_request(
         &mut self,
         request_id: RequestId,
         allocated_blocks: &HashSet<BlockId>,
-        request_lookup: &HashMap<RequestId, Request>,
+        request_lookup: &BTreeMap<RequestId, Request>,
     ) -> Result<(), AllocationError> {
         let request = request_lookup
             .get(&request_id)
             .expect("request missing in lookup");
 
         assert!(
-            request.n_users <= allocated_blocks.len(),
-            "too few blocks allocated for request"
+            request.num_blocks.unwrap() == allocated_blocks.len(),
+            "incorrect number of blocks allocated for request"
         );
 
         if self.requests.get(&request_id).is_none() {
@@ -331,7 +350,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
                 Some(Node::RequestBlock { block_id, .. })
                     if allocated_blocks.contains(block_id) =>
                 {
-                    Some(*node_idx)
+                    Some(*node_idx) // NOTE: HERE COULD ALSO KEEP THE BLOCK ID IN THE LIST
                 }
                 Some(Node::RequestBlock { .. }) => None, // ignore request block from a different block
                 _ => panic!("must be request block + weight defined"),
@@ -353,8 +372,8 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
         // subtract the cost from each connected segment
         for segment_idx in segments_to_subtract_costs {
             match self.graph.node_weight_mut(segment_idx) {
-                Some(Node::BlockSegmentConstraint { budget }) => {
-                    budget.subtract_cost(&request.request_cost)
+                Some(Node::BlockSegmentConstraint { budget, privacy_unit }) => {
+                    budget.subtract_cost(request.request_cost(privacy_unit))
                 }
                 _ => panic!("something went wrong"),
             }
@@ -373,7 +392,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
         &self,
         request_id: RequestId,
         block_order_strategy: Option<BlockOrderStrategy>,
-        request_lookup: &HashMap<RequestId, Request>,
+        request_lookup: &BTreeMap<RequestId, Request>,
     ) -> StatusResult {
         if !self.requests.contains_key(&request_id) {
             return StatusResult::Rejected;
@@ -404,7 +423,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
         }
 
         let request = request_lookup.get(&request_id).expect("missing request");
-        if acceptable_blocks.len() >= request.n_users {
+        if acceptable_blocks.len() >= request.num_blocks.unwrap() {
             StatusResult::Acceptable {
                 acceptable: acceptable_blocks,
                 contested: contested_blocks,
@@ -419,10 +438,11 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
 
     /// Returns the first acceptable request according to the strategy (if any request is still
     /// acceptable)
+    #[allow(dead_code)]
     pub(crate) fn next_acceptable(
         &self,
         block_order_strategy: Option<BlockOrderStrategy>,
-        request_lookup: &HashMap<RequestId, Request>,
+        request_lookup: &BTreeMap<RequestId, Request>,
     ) -> Option<AcceptableRequest> {
         let min_acceptable_request_id = self
             .requests
@@ -432,7 +452,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
                     >= request_lookup
                         .get(request_id)
                         .expect("missing request in lookup")
-                        .n_users
+                        .num_blocks.unwrap()
             })
             .min();
 
@@ -593,7 +613,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
 
         let iter = self.graph.node_indices().sorted().filter_map(|node_idx| {
             match self.graph.node_weight(node_idx) {
-                Some(Node::BlockSegmentConstraint { budget }) => {
+                Some(Node::BlockSegmentConstraint { budget , privacy_unit: _}) => {
                     let block_id = self
                         .graph
                         .neighbors(node_idx)
@@ -624,7 +644,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
     fn remove_request_blocks(
         &mut self,
         request_block_idx_set: Vec<NodeIndex>,
-        request_lookup: &HashMap<RequestId, Request>,
+        request_lookup: &BTreeMap<RequestId, Request>,
     ) {
         let concurrent_remove_queue: ConcurrentQueue<NodeIndex> = ConcurrentQueue::unbounded();
 
@@ -682,7 +702,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
                 let is_removed = request_block_idx_set.remove(&node_idx);
                 assert!(is_removed, "node idx not found for removal");
 
-                if request_block_idx_set.len() < request.n_users {
+                if request_block_idx_set.len() < request.num_blocks.unwrap() {
                     //println!("remove all  request_id={}", request_id);
                     // because of removal -> not enough blocks remaining for request => delete all remaining request blocks
                     for idx in request_block_idx_set.iter() {
@@ -703,12 +723,12 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
         segment_idx: NodeIndex,
         ignore_request_block_idx: Option<NodeIndex>,
         remove_request_block_queue: &ConcurrentQueue<NodeIndex>,
-        request_lookup: &HashMap<RequestId, Request>,
+        request_lookup: &BTreeMap<RequestId, Request>,
     ) -> bool {
         let budget = self.node_block_segment_constraint(&segment_idx);
 
         // sum request cost of incoming edges (!= ignore) and also ignore incoming requests where individual request costs already exceed the budget -> they need to be deleted
-        let request_cost_sum = self
+        let request_cost_sum: Option<AccountingType> = self
             .graph
             .neighbors(segment_idx)
             .filter_map(|request_block_idx| {
@@ -717,12 +737,14 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
                     return None;
                 }
 
-                let (request_id, _block_id) = self.node_request_block(&request_block_idx);
+                let (request_id, block_id) = self.node_request_block(&request_block_idx);
 
                 let request = request_lookup.get(&request_id).expect("missing request");
 
-                if budget.is_budget_sufficient(&request.request_cost) {
-                    Some(&request.request_cost)
+                let privacy_unit = self.privacy_unit_lookup.get(&block_id).expect("missing block");
+
+                if budget.is_budget_sufficient(request.request_cost(privacy_unit)) {
+                    Some(request.request_cost(privacy_unit))
                 } else {
                     remove_request_block_queue
                         .push(request_block_idx)
@@ -760,7 +782,7 @@ impl<M: SegmentBudget> ProblemFormulation<M> {
 
     fn node_block_segment_constraint(&self, node_idx: &NodeIndex) -> &M {
         match self.graph.node_weight(*node_idx) {
-            Some(Node::BlockSegmentConstraint { budget }) => budget,
+            Some(Node::BlockSegmentConstraint { budget , privacy_unit:_}) => budget,
             _ => panic!("not found"),
         }
     }
@@ -830,14 +852,16 @@ impl<M: SegmentBudget> BlockSegment<M> {
 mod tests {
     use std::collections::{BTreeSet, HashMap, HashSet};
 
+    use crate::block::Block;
     use crate::composition::{block_composition, block_composition_pa, CompositionConstraint};
     use crate::config::SegmentationAlgo;
+    use crate::dprivacy::privacy_unit::PrivacyUnit;
     use crate::request::RequestBuilder;
+    use crate::simulation::RoundId;
     use crate::util::{self, build_dummy_schema};
     use crate::AccountingType::EpsDp;
-    use crate::BlockId::User;
+    use crate::BlockId;
     use crate::{
-        block::BlockId,
         composition::ProblemFormulation,
         dprivacy::{
             budget::{OptimalBudget, SegmentBudget},
@@ -875,12 +899,26 @@ mod tests {
             contested_segments,
         };
 
-        let block_id = BlockId::User(1);
+        let block_id = BlockId(1);
+
+        let block = Block{
+            id: block_id,
+            request_history: Vec::new(),
+            default_unlocked_budget: Some(AccountingType::EpsDp { eps: 1.0 }),
+            default_total_budget: Some(AccountingType::EpsDp { eps: 1.0 }),
+            budget_by_section: Vec::new(),
+            privacy_unit: PrivacyUnit::User,
+            privacy_unit_selection: None,
+            created: RoundId(0),
+            retired: None,
+        };
+
+        let block_lookup = HashMap::from([(block_id, block)]);
 
         block_constraints.insert(block_id, block_constraint);
 
         let problem_formulation: ProblemFormulation<OptimalBudget> =
-            ProblemFormulation::new(block_constraints, &candidate_requests);
+            ProblemFormulation::new(block_constraints, &candidate_requests, &block_lookup);
 
         println!("{}", problem_formulation.visualize());
 
@@ -944,11 +982,11 @@ mod tests {
 
         RequestBuilder::new(
             RequestId(id),
-            AccountingType::EpsDp { eps: 0.5 },
+            HashMap::from([(PrivacyUnit::User, AccountingType::EpsDp { eps: 0.5 })]),
+            HashMap::new(),
             1,
             1,
             &schema,
-            std::default::Default::default(),
         )
         .build()
     }
@@ -1021,7 +1059,7 @@ mod tests {
         // allocate r0 and r1, making r5 rejected
         pf.allocate_request(
             RequestId(0),
-            &HashSet::from_iter((0..10).map(User)),
+            &HashSet::from_iter((0..10).map(BlockId)),
             &requests,
         )
         .expect("Allocating request failed");
@@ -1031,7 +1069,7 @@ mod tests {
 
         pf.allocate_request(
             RequestId(1),
-            &HashSet::from_iter((0..10).map(User)),
+            &HashSet::from_iter((0..10).map(BlockId)),
             &requests,
         )
         .expect("Allocating request failed");
@@ -1063,7 +1101,7 @@ mod tests {
 
         pf.allocate_request(
             RequestId(3),
-            &HashSet::from_iter((0..10).map(User)),
+            &HashSet::from_iter((0..10).map(BlockId)),
             &requests,
         )
         .expect("Allocating request failed");
@@ -1132,7 +1170,7 @@ mod tests {
             }
         }
 
-        pf.allocate_request(RequestId(0), &(0..10).map(User).collect(), &requests)
+        pf.allocate_request(RequestId(0), &(0..10).map(BlockId).collect(), &requests)
             .expect("Allocating request failed");
 
         // check that the status of all requests (except 0) is contested
@@ -1153,7 +1191,7 @@ mod tests {
             _ => panic!("Request 0 should be rejected"),
         }
 
-        pf.allocate_request(RequestId(1), &(0..10).map(User).collect(), &requests)
+        pf.allocate_request(RequestId(1), &(0..10).map(BlockId).collect(), &requests)
             .expect("Allocating request failed");
 
         // no more contested segments, as all requests rejected
@@ -1195,7 +1233,7 @@ mod tests {
 
         pf.allocate_request(
             RequestId(42),
-            &HashSet::from_iter((0..10).map(User)),
+            &HashSet::from_iter((0..10).map(BlockId)),
             &requests,
         )
         .expect("Allocating request failed");
@@ -1208,9 +1246,9 @@ mod tests {
 
         // any two requests should be allocatable, but no more (and not the same twice)
         for rid in requests.keys().take(1) {
-            pf.allocate_request(*rid, &HashSet::from_iter((0..10).map(User)), &requests)
+            pf.allocate_request(*rid, &HashSet::from_iter((0..10).map(BlockId)), &requests)
                 .expect("Allocating request failed");
-            pf.allocate_request(*rid, &HashSet::from_iter((0..10).map(User)), &requests)
+            pf.allocate_request(*rid, &HashSet::from_iter((0..10).map(BlockId)), &requests)
                 .expect("Allocating request failed");
         }
     }
@@ -1222,7 +1260,7 @@ mod tests {
 
         // any two requests should be allocatable, but no more
         for rid in requests.keys().take(3) {
-            pf.allocate_request(*rid, &HashSet::from_iter((0..10).map(User)), &requests)
+            pf.allocate_request(*rid, &HashSet::from_iter((0..10).map(BlockId)), &requests)
                 .expect("Allocating request failed");
         }
     }
@@ -1234,7 +1272,7 @@ mod tests {
 
         // any two requests should be allocatable, but no more
         for rid in requests.keys().take(2) {
-            pf.allocate_request(*rid, &HashSet::from_iter((10..20).map(User)), &requests)
+            pf.allocate_request(*rid, &HashSet::from_iter((10..20).map(BlockId)), &requests)
                 .expect("Allocating request failed");
         }
     }
@@ -1259,7 +1297,7 @@ mod tests {
 
         pf.allocate_request(
             RequestId(0),
-            &HashSet::from_iter((0..10).map(User)),
+            &HashSet::from_iter((0..10).map(BlockId)),
             &requests,
         )
         .expect("Allocating request failed");
@@ -1300,8 +1338,8 @@ mod tests {
         ProblemFormulation<OptimalBudget>,
     ) {
         let _n_blocks: usize = 5;
-
-        let schema = build_dummy_schema(EpsDp { eps: 1.0 });
+        let budget = EpsDp { eps: 1.0 };
+        let schema = build_dummy_schema(budget.clone());
 
         let mut requests =
             crate::util::build_dummy_requests_with_pa(&schema, 10, EpsDp { eps: 0.4 }, 6);
@@ -1309,7 +1347,7 @@ mod tests {
         assert!(n_requests <= requests.len());
         requests.retain(|rid, _| *rid < RequestId(n_requests));
 
-        let blocks = crate::util::generate_blocks(0, n_blocks, EpsDp { eps: 1.0 });
+        let blocks = crate::util::generate_blocks(0, n_blocks, budget.clone(), budget);
 
         let block_composition = block_composition::build_block_composition();
 
@@ -1332,15 +1370,17 @@ mod tests {
     ) {
         let _n_blocks: usize = 5;
 
-        let schema = build_dummy_schema(EpsDp { eps: 1.0 });
+        let budget = EpsDp { eps: 1.0 };
+
+        let schema = build_dummy_schema(budget.clone());
 
         let requests =
             crate::util::build_dummy_requests_with_pa(&schema, 10, EpsDp { eps: 0.4 }, 6);
 
-        let blocks = crate::util::generate_blocks(0, n_blocks, EpsDp { eps: 1.0 });
+        let blocks = crate::util::generate_blocks(0, n_blocks, budget.clone(), budget);
 
         let block_composition =
-            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray);
+            block_composition_pa::build_block_part_attributes(SegmentationAlgo::Narray, None);
 
         let pf = block_composition.build_problem_formulation::<OptimalBudget>(
             &blocks,

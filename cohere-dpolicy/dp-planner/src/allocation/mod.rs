@@ -1,35 +1,26 @@
-pub mod dpf;
+
 pub mod efficiency_based;
-pub mod greedy;
-pub mod ilp;
 pub mod utils;
 
-use grb::Status;
-use ilp::stats::IlpStats;
-use std::collections::{HashMap, HashSet};
-
-use crate::allocation::dpf::Dpf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use crate::allocation::efficiency_based::EfficiencyBased;
-use crate::allocation::greedy::Greedy;
-use crate::allocation::ilp::Ilp;
 use crate::allocation::BlockCompWrapper::{
     BlockCompositionPartAttributesVariant, BlockCompositionVariant,
 };
 use crate::composition::block_composition::{build_block_composition, BlockComposition};
-use crate::composition::block_composition_pa::{
-    build_block_part_attributes, BlockCompositionPartAttributes,
-};
+use crate::composition::block_composition_pa::{build_block_part_attributes, BlockCompositionPartAttributes, NArrayCache};
 use crate::composition::{CompositionConstraint, ProblemFormulation};
 use crate::config::BudgetType;
 use crate::dprivacy::budget::{RdpMinBudget, SegmentBudget};
-use crate::logging::{DpfStats, GreedyStats, RuntimeKind, RuntimeMeasurement};
+use crate::logging::{DpfStats, RuntimeKind, RuntimeMeasurement};
 use crate::{
     block::{Block, BlockId},
     config::{AllocationConfig, CompositionConfig},
     request::{Request, RequestId},
     schema::Schema,
 };
-use crate::{AccountingType, OptimalBudget};
+use crate::OptimalBudget;
 
 /// Contains a final allocation after an allocation method was run.
 /// For accepted requests, contains the request id and block ids of allocated blocks,
@@ -53,83 +44,49 @@ pub enum BlockCompWrapper {
 /// Constructed via [construct_allocator]
 #[allow(clippy::large_enum_variant)]
 pub enum AllocationRound {
-    Dpf(Dpf, BlockCompWrapper, BudgetType),
-    Ilp(Ilp, BlockCompWrapper, BudgetType),
-    Greedy(Greedy, BlockCompWrapper, BudgetType),
+//    Dpf(Dpf, BlockCompWrapper, BudgetType),
+//    Ilp(Ilp, BlockCompWrapper, BudgetType),
+//    Greedy(Greedy, BlockCompWrapper, BudgetType),
     EfficiencyBased(EfficiencyBased, BlockCompWrapper, BudgetType),
 }
 
 /// Used for passing the status of the ilp model after optimization to simulation.rs - if the
 /// allocation method is not ilp, it is just None.
 pub enum AllocationStatus {
-    GreedyStatus(GreedyStats),
+    //GreedyStatus(GreedyStats),
     DpfStatus(DpfStats),
-    IlpRegularStatus(grb::Status, IlpStats),
-    IlpOtherStatus(&'static str, IlpStats),
+    //IlpRegularStatus(grb::Status, IlpStats),
+    //IlpOtherStatus(&'static str, IlpStats),
 }
 
 impl AllocationStatus {
     /// Get the number of contested segments when the problem formulation is first constructed.
     pub fn get_initial_num_contested_segments(&self) -> Option<usize> {
         match self {
-            AllocationStatus::GreedyStatus(greedy_stats) => {
-                Some(greedy_stats.num_contested_segments_initially)
-            }
             AllocationStatus::DpfStatus(dpf_stats) => {
                 Some(dpf_stats.num_contested_segments_initially)
-            }
-            AllocationStatus::IlpRegularStatus(_, ilp_stats) => {
-                Some(ilp_stats.num_contested_segments_initially)
-            }
-            AllocationStatus::IlpOtherStatus(_, ilp_stats) => {
-                Some(ilp_stats.num_contested_segments_initially)
             }
         }
     }
 
     pub fn to_string(&self) -> &'static str {
         match self {
-            AllocationStatus::IlpRegularStatus(grb_status, ..) => match grb_status {
-                Status::Loaded => "Loaded",
-                Status::Optimal => "Optimal",
-                Status::Infeasible => "Infeasible",
-                Status::InfOrUnbd => "InfOrUnbd",
-                Status::Unbounded => "Unbounded",
-                Status::CutOff => "CutOff",
-                Status::IterationLimit => "IterationLimit",
-                Status::NodeLimit => "NodeLimit",
-                Status::TimeLimit => "TimeLimit",
-                Status::SolutionLimit => "SolutionLimit",
-                Status::Interrupted => "Interrupted",
-                Status::Numeric => "Numeric",
-                Status::SubOptimal => "SubOptimal",
-                Status::InProgress => "InProgress",
-                Status::UserObjLimit => "UserObjLimit",
-            },
-            AllocationStatus::GreedyStatus(..) => "n/a",
             AllocationStatus::DpfStatus(..) => "n/a",
-            AllocationStatus::IlpOtherStatus(content, ..) => content,
         }
     }
 
-    pub fn get_ilp_stats(&self) -> Option<&IlpStats> {
-        match self {
-            AllocationStatus::GreedyStatus(..) => None,
-            AllocationStatus::DpfStatus(..) => None,
-            AllocationStatus::IlpRegularStatus(_, ilp_stats) => Some(ilp_stats),
-            AllocationStatus::IlpOtherStatus(_, ilp_stats) => Some(ilp_stats),
-        }
-    }
+
 }
 
 impl CompositionConstraint for BlockCompWrapper {
     fn build_problem_formulation<M: SegmentBudget>(
         &self,
         blocks: &HashMap<BlockId, Block>,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &BTreeMap<RequestId, Request>,
         history_requests: &HashMap<RequestId, Request>,
         schema: &Schema,
         runtime_measurements: &mut Vec<RuntimeMeasurement>,
+        block_narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>>
     ) -> ProblemFormulation<M> {
         let mut prob_meas = RuntimeMeasurement::start(RuntimeKind::BuildProblemFormulation);
         let pf = match self {
@@ -139,6 +96,7 @@ impl CompositionConstraint for BlockCompWrapper {
                 history_requests,
                 schema,
                 runtime_measurements,
+                block_narray_cache
             ),
             BlockCompositionVariant(bc) => bc.build_problem_formulation(
                 blocks,
@@ -146,6 +104,7 @@ impl CompositionConstraint for BlockCompWrapper {
                 history_requests,
                 schema,
                 runtime_measurements,
+                block_narray_cache
             ),
         };
         runtime_measurements.push(prob_meas.stop());
@@ -165,87 +124,6 @@ impl CompositionConstraint for BlockCompWrapper {
 pub fn construct_allocator(allocation_config: &AllocationConfig) -> AllocationRound {
     // TODO could shorten code by using macros or implementing trait for batch schedulers
     match allocation_config {
-        AllocationConfig::Greedy { composition } => {
-            let (block_comp_wrapper, budget_type) = match composition {
-                CompositionConfig::BlockCompositionPa {
-                    budget: _budget,
-                    algo,
-                    budget_type,
-                } => (
-                    BlockCompositionPartAttributesVariant(build_block_part_attributes(*algo)),
-                    budget_type,
-                ),
-                CompositionConfig::BlockComposition {
-                    budget: _budget,
-                    budget_type,
-                } => (
-                    BlockCompositionVariant(build_block_composition()),
-                    budget_type,
-                ),
-            };
-
-            let allocator = greedy::Greedy::construct_allocator();
-
-            AllocationRound::Greedy(allocator, block_comp_wrapper, budget_type.clone())
-        }
-        AllocationConfig::Ilp { composition } => {
-            let (block_comp_wrapper, budget_type) = match composition {
-                CompositionConfig::BlockCompositionPa {
-                    budget: _budget,
-                    algo,
-                    budget_type,
-                } => (
-                    BlockCompositionPartAttributesVariant(build_block_part_attributes(*algo)),
-                    budget_type,
-                ),
-                CompositionConfig::BlockComposition {
-                    budget: _budget,
-                    budget_type,
-                } => (
-                    BlockCompositionVariant(build_block_composition()),
-                    budget_type,
-                ),
-            };
-
-            let allocator = ilp::Ilp::construct_allocator();
-
-            AllocationRound::Ilp(allocator, block_comp_wrapper, budget_type.clone())
-        }
-        AllocationConfig::Dpf {
-            block_selector_seed: seed,
-            composition,
-            weighted_dpf,
-            dominant_share_by_remaining_budget,
-        } => {
-            let (budget, block_comp_wrapper, budget_type) = match composition {
-                CompositionConfig::BlockCompositionPa {
-                    budget,
-                    algo,
-                    budget_type,
-                } => (
-                    budget,
-                    BlockCompositionPartAttributesVariant(build_block_part_attributes(*algo)),
-                    budget_type,
-                ),
-                CompositionConfig::BlockComposition {
-                    budget,
-                    budget_type,
-                } => (
-                    budget,
-                    BlockCompositionVariant(build_block_composition()),
-                    budget_type,
-                ),
-            };
-
-            let allocator = dpf::Dpf::construct_allocator(
-                &budget.budget(),
-                *seed,
-                *weighted_dpf,
-                *dominant_share_by_remaining_budget,
-            );
-
-            AllocationRound::Dpf(allocator, block_comp_wrapper, budget_type.clone())
-        }
         AllocationConfig::EfficiencyBased {
             algo_type,
             block_selector_seed,
@@ -256,9 +134,10 @@ pub fn construct_allocator(allocation_config: &AllocationConfig) -> AllocationRo
                     budget,
                     algo,
                     budget_type,
+                    num_threads,
                 } => (
                     budget,
-                    BlockCompositionPartAttributesVariant(build_block_part_attributes(*algo)),
+                    BlockCompositionPartAttributesVariant(build_block_part_attributes(*algo, num_threads.clone())),
                     budget_type,
                 ),
                 CompositionConfig::BlockComposition {
@@ -294,70 +173,12 @@ impl AllocationRound {
         &mut self,
         request_history: &HashMap<RequestId, Request>,
         available_blocks: &HashMap<BlockId, Block>,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &mut BTreeMap<RequestId, Request>,
         schema: &Schema,
-        alphas: &Option<AccountingType>,
         runtime_measurements: &mut Vec<RuntimeMeasurement>,
+        block_narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>>,
     ) -> (ResourceAllocation, AllocationStatus) {
         match self {
-            AllocationRound::Dpf(allocator, block_comp_wrapper, budget_type) => match budget_type {
-                BudgetType::OptimalBudget => allocator.round::<OptimalBudget>(
-                    candidate_requests,
-                    request_history,
-                    available_blocks,
-                    schema,
-                    block_comp_wrapper,
-                    runtime_measurements,
-                ),
-                BudgetType::RdpMinBudget => allocator.round::<RdpMinBudget>(
-                    candidate_requests,
-                    request_history,
-                    available_blocks,
-                    schema,
-                    block_comp_wrapper,
-                    runtime_measurements,
-                ),
-            },
-            AllocationRound::Ilp(allocator, block_comp_wrapper, budget_type) => match budget_type {
-                BudgetType::OptimalBudget => allocator.round::<OptimalBudget>(
-                    candidate_requests,
-                    request_history,
-                    available_blocks,
-                    schema,
-                    block_comp_wrapper,
-                    alphas,
-                    runtime_measurements,
-                ),
-                BudgetType::RdpMinBudget => allocator.round::<RdpMinBudget>(
-                    candidate_requests,
-                    request_history,
-                    available_blocks,
-                    schema,
-                    block_comp_wrapper,
-                    alphas,
-                    runtime_measurements,
-                ),
-            },
-            AllocationRound::Greedy(allocator, block_comp_wrapper, budget_type) => {
-                match budget_type {
-                    BudgetType::OptimalBudget => allocator.round::<OptimalBudget>(
-                        candidate_requests,
-                        request_history,
-                        available_blocks,
-                        schema,
-                        block_comp_wrapper,
-                        runtime_measurements,
-                    ),
-                    BudgetType::RdpMinBudget => allocator.round::<RdpMinBudget>(
-                        candidate_requests,
-                        request_history,
-                        available_blocks,
-                        schema,
-                        block_comp_wrapper,
-                        runtime_measurements,
-                    ),
-                }
-            }
             AllocationRound::EfficiencyBased(allocator, block_comp_wrapper, budget_type) => {
                 match budget_type {
                     BudgetType::OptimalBudget => allocator.round::<OptimalBudget>(
@@ -367,6 +188,7 @@ impl AllocationRound {
                         schema,
                         block_comp_wrapper,
                         runtime_measurements,
+                        block_narray_cache
                     ),
                     BudgetType::RdpMinBudget => allocator.round::<RdpMinBudget>(
                         candidate_requests,
@@ -375,6 +197,7 @@ impl AllocationRound {
                         schema,
                         block_comp_wrapper,
                         runtime_measurements,
+                        block_narray_cache
                     ),
                 }
             }

@@ -1,14 +1,12 @@
 //! Contains various functions useful to run the simulation
 
-use crate::allocation::{AllocationStatus, ResourceAllocation};
+use crate::allocation::ResourceAllocation;
 use crate::config::{Budget, UnlockingBudgetTrigger};
-use crate::dprivacy::AccountingType;
 use crate::{
     logging, Accounting, Block, BlockId, ConfigAndSchema, Request, RequestCollection, RequestId,
     RoundId, SimulationConfig,
 };
 use csv::Writer;
-use float_cmp::{ApproxEq, F64Margin};
 use log::info;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
@@ -31,26 +29,34 @@ use super::BatchingStrategy;
 pub fn update_block_unlocked_budget(
     available_blocks: &mut HashMap<BlockId, Block>,
     budget_config: &Budget,
-    unreduced_budget_config: &Budget,
-    n_requests: usize,
     simulation_round: RoundId,
 ) {
     //TODO possibly introduce counter and compute anew each time from max budget (If there are a lot of update steps, will get numerically inaccurate result)
-    let total = budget_config.budget();
-    let unreduced_total = unreduced_budget_config.budget();
+
     for (_, block) in available_blocks.iter_mut() {
-        assert!(total.check_same_type(&block.unlocked_budget));
-        assert!(unreduced_total.check_same_type(&block.unreduced_unlocked_budget));
+
+        match (&block.default_unlocked_budget, &block.default_total_budget) {
+            (Some(unlocked_budget), Some(total_budget)) => {
+                assert!(unlocked_budget.approx_le(total_budget), "Block {:?} has different budget than total budget: {:?} vs {:?}", block.id, unlocked_budget, total_budget);
+            }
+            (None, None) => {
+                // if both are None, we do not need to check anything
+            }
+            _ => {
+                panic!("Block {:?} has different budget than total budget: {:?} vs {:?}", block.id, block.default_unlocked_budget, block.default_total_budget);
+            }
+        }
+        // TODO: CHECK THIS INVARIANCES ALSO FOR THE SECTIONS
     }
 
     match budget_config {
         Budget::FixBudget { .. } => {
-            assert!(budget_config
-                .budget()
-                .approx_eq(&total, F64Margin::default())); // no blocks update
             for (_, block) in available_blocks.iter_mut() {
-                block.unlocked_budget = total.clone();
-                block.unreduced_unlocked_budget = unreduced_total.clone();
+                block.default_unlocked_budget = block.default_total_budget.clone();
+
+                block.budget_by_section.iter_mut().for_each(|section| {
+                    section.unlocked_budget = section.total_budget.clone();
+                });
             }
         }
         Budget::UnlockingBudget {
@@ -75,55 +81,7 @@ pub fn update_block_unlocked_budget(
                     slack,
                     *n_total_steps,
                     curr_block,
-                    &total,
-                    &unreduced_total,
                 );
-            }
-        }
-        Budget::UnlockingBudget {
-            trigger: UnlockingBudgetTrigger::Request,
-            n_steps: n_total_steps,
-            slack,
-            ..
-        } => {
-            assert!(
-                slack.is_none(),
-                "slack is not supported for request unlocking"
-            );
-
-            let n_my_steps = n_requests;
-
-            // TODO: for EpsDeltaDP delta should be available immediately fully.
-            // reworked to always use clone instead of update_step, due to numerical stability
-            let mut update_step = total.clone();
-            update_step.apply_func(&|x: f64| x / *n_total_steps as f64 * n_my_steps as f64);
-            assert!(update_step.approx_le(&total));
-
-            let mut unreduced_update_step = unreduced_total.clone();
-            unreduced_update_step
-                .apply_func(&|x: f64| x / *n_total_steps as f64 * n_my_steps as f64);
-            assert!(unreduced_update_step.approx_le(&unreduced_total));
-
-            // apply the update step on each block
-            for (_, curr_block) in available_blocks.iter_mut() {
-                if curr_block.created == simulation_round {
-                    // if the block joined this round, want to make sure it starts with correct budget
-                    curr_block.unlocked_budget = update_step.clone();
-                    curr_block.unreduced_unlocked_budget = unreduced_update_step.clone();
-                } else {
-                    let new_budget = &curr_block.unlocked_budget + &update_step;
-                    let unreduced_new_budget =
-                        &curr_block.unreduced_unlocked_budget + &unreduced_update_step;
-
-                    // update the unlocked block budget (don't exceed total budget)
-                    if new_budget.approx_le(&total) {
-                        curr_block.unlocked_budget = new_budget;
-                        curr_block.unreduced_unlocked_budget = unreduced_new_budget;
-                    } else {
-                        curr_block.unlocked_budget = total.clone();
-                        curr_block.unreduced_unlocked_budget = unreduced_total.clone();
-                    }
-                }
             }
         }
     }
@@ -134,8 +92,6 @@ fn unlock_budget_by_round(
     slack: f64,
     n_total_steps: usize,
     block: &mut Block,
-    total_budget: &AccountingType,
-    unreduced_total_budget: &AccountingType,
 ) {
     let block_age = ((simulation_round - block.created).0 + 1).min(n_total_steps);
     let mid = (n_total_steps as f64 / 2_f64).ceil() as usize;
@@ -149,18 +105,25 @@ fn unlock_budget_by_round(
     let unlocked_budget_factor =
         (block_age as f64 + slack_factor as f64 * slack) / n_total_steps as f64;
 
-    // set unlocked budget
-    let mut unlocked_budget = total_budget.clone();
-    unlocked_budget.apply_func(&|total_budget: f64| total_budget * unlocked_budget_factor);
-    assert!(unlocked_budget.approx_le(total_budget));
-    block.unlocked_budget = unlocked_budget;
+    // update the default block budget (new unlocked budget)
 
-    // set unreduced unlocked budget
-    let mut unreduced_unlocked_budget = unreduced_total_budget.clone();
-    unreduced_unlocked_budget
-        .apply_func(&|total_budget: f64| total_budget * unlocked_budget_factor);
-    assert!(unreduced_unlocked_budget.approx_le(unreduced_total_budget));
-    block.unreduced_unlocked_budget = unreduced_unlocked_budget;
+    if let Some(total_budget) = &block.default_total_budget {
+        let mut unlocked_budget = total_budget.clone();
+        unlocked_budget.apply_func(&|total_budget: f64| total_budget * unlocked_budget_factor);
+
+        assert!(unlocked_budget.approx_le(block.default_total_budget.as_ref().expect("Block has no total budget")));
+
+        block.default_unlocked_budget = Some(unlocked_budget.clone());
+    }
+
+    // update the budget for each section (new unlocked budget)
+    block.budget_by_section.iter_mut().for_each(|section| {
+        let mut unlocked_budget = section.total_budget.clone();
+        unlocked_budget.apply_func(&|total_budget: f64| total_budget * unlocked_budget_factor);
+        assert!(unlocked_budget.approx_le(&section.total_budget));
+
+        section.unlocked_budget = unlocked_budget.clone();
+    });
 }
 
 /// This function updates the history of the passed blocks
@@ -297,12 +260,12 @@ pub fn pre_round_request_batch_update(
             let n_requests = request_collection
                 .sorted_candidates
                 .iter()
-                .position(|req| req.created.unwrap() > simulation_round)
+                .position(|req| req.created > simulation_round)
                 .unwrap_or(request_collection.sorted_candidates.len()); // all request
 
             assert!(
                 request_collection.sorted_candidates[n_requests - 1].created
-                    == Some(simulation_round),
+                    == simulation_round,
                 "The first `n_requests` request need to be from this simulation round."
             );
 
@@ -370,7 +333,6 @@ pub fn process_round_results(
     is_final_round: bool,
     assignment: &ResourceAllocation,
     config_and_schema: &ConfigAndSchema,
-    allocation_status: &AllocationStatus,
     request_start_rounds: &HashMap<RequestId, RoundId>,
 ) {
     *total_profit += assignment
@@ -405,11 +367,10 @@ pub fn process_round_results(
                 &assigned_blocks,
                 simulation_config,
                 config_and_schema,
-                allocation_status.get_ilp_stats(),
             );
 
             // add to request history
-            assert!(assigned_blocks.len() >= request.n_users);
+            assert!(assigned_blocks.len() >= request.num_blocks.unwrap());
             let inserted = request_collection
                 .accepted
                 .insert(*rid, assignment.accepted[rid].clone());
@@ -439,7 +400,6 @@ pub fn process_round_results(
                     &BTreeSet::<BlockId>::new(),
                     simulation_config,
                     config_and_schema,
-                    allocation_status.get_ilp_stats(),
                 );
             }
 
@@ -473,22 +433,25 @@ mod tests {
 
     use crate::{
         block::{Block, BlockId},
-        dprivacy::{rdp_alphas_accounting::RdpAlphas, AccountingType},
+        dprivacy::{privacy_unit::PrivacyUnit, rdp_alphas_accounting::RdpAlphas, AccountingType},
         simulation::{util::unlock_budget_by_round, RoundId},
     };
 
     fn _create_block(round: usize) -> Block {
         Block {
-            id: BlockId::User(round),
+            id: BlockId(round),
             created: RoundId(round),
             retired: None,
-            unlocked_budget: AccountingType::Rdp {
-                eps_values: RdpAlphas::A2([0.0, 0.0]),
-            },
-            unreduced_unlocked_budget: AccountingType::Rdp {
+            default_unlocked_budget:  Some(AccountingType::Rdp {
                 eps_values: RdpAlphas::A3([0.0, 0.0, 0.0]),
-            },
+            }),
+            default_total_budget: Some(AccountingType::Rdp {
+                eps_values: RdpAlphas::A3([0.0, 0.0, 0.0]),
+            }),
+            budget_by_section: vec![],
             request_history: vec![],
+            privacy_unit: PrivacyUnit::User,
+            privacy_unit_selection: None,
         }
     }
 
@@ -498,11 +461,6 @@ mod tests {
         }
     }
 
-    fn _rdp_a2(x1: f64, x2: f64) -> AccountingType {
-        AccountingType::Rdp {
-            eps_values: RdpAlphas::A2([x1, x2]),
-        }
-    }
 
     #[test]
     fn test_budget_unlocking_by_round_with_noslack() {
@@ -516,11 +474,7 @@ mod tests {
             let share_b = 1.0;
             let share_c = 2.0;
 
-            let total_budget = _rdp_a2(
-                n_total_steps as f64 * share_a,
-                n_total_steps as f64 * share_b,
-            );
-            let unreduced_total_budget = _rdp_a3(
+            let total_budget = _rdp_a3(
                 n_total_steps as f64 * share_a,
                 n_total_steps as f64 * share_b,
                 n_total_steps as f64 * share_c,
@@ -528,19 +482,15 @@ mod tests {
 
             for i in 0..n_total_steps {
                 let mut block = _create_block(n_total_steps - i);
+                block.default_total_budget = Some(total_budget.clone());
                 unlock_budget_by_round(
                     simulation_round,
                     slack,
                     n_total_steps,
                     &mut block,
-                    &total_budget,
-                    &unreduced_total_budget,
                 );
                 let x = (i + 1) as f64;
-                assert!(block
-                    .unlocked_budget
-                    .approx_eq(&_rdp_a2(x * share_a, x * share_b), F64Margin::default()));
-                assert!(block.unreduced_unlocked_budget.approx_eq(
+                assert!(block.default_unlocked_budget.unwrap().approx_eq(
                     &_rdp_a3(x * share_a, x * share_b, x * share_c),
                     F64Margin::default()
                 ));
@@ -568,33 +518,26 @@ mod tests {
 
         let n_total_steps = even_slack.len();
         let simulation_round = RoundId(n_total_steps);
-        let total_budget = _rdp_a2(
-            n_total_steps as f64 * share_a,
-            n_total_steps as f64 * share_b,
-        );
-        let unreduced_total_budget = _rdp_a3(
+
+        let total_budget = _rdp_a3(
             n_total_steps as f64 * share_a,
             n_total_steps as f64 * share_b,
             n_total_steps as f64 * share_c,
         );
         for i in 0..n_total_steps {
             let mut block = _create_block(n_total_steps - i);
+            block.default_total_budget = Some(total_budget.clone());
             unlock_budget_by_round(
                 simulation_round,
                 slack,
                 n_total_steps,
                 &mut block,
-                &total_budget,
-                &unreduced_total_budget,
             );
             let x: f64 = even_slack[0..=i].iter().sum();
             assert!(block
-                .unlocked_budget
-                .approx_eq(&_rdp_a2(x * share_a, x * share_b), F64Margin::default()));
-            assert!(block.unreduced_unlocked_budget.approx_eq(
-                &_rdp_a3(x * share_a, x * share_b, x * share_c),
-                F64Margin::default()
-            ));
+                .default_unlocked_budget
+                .unwrap()
+                .approx_eq(&_rdp_a3(x * share_a, x * share_b, x * share_c), F64Margin::default()));
         }
 
         // check odd slack
@@ -610,33 +553,26 @@ mod tests {
 
         let n_total_steps = odd_slack.len();
         let simulation_round = RoundId(n_total_steps);
-        let total_budget = _rdp_a2(
-            n_total_steps as f64 * share_a,
-            n_total_steps as f64 * share_b,
-        );
-        let unreduced_total_budget = _rdp_a3(
+
+        let total_budget = _rdp_a3(
             n_total_steps as f64 * share_a,
             n_total_steps as f64 * share_b,
             n_total_steps as f64 * share_c,
         );
         for i in 0..n_total_steps {
             let mut block = _create_block(n_total_steps - i);
+            block.default_total_budget = Some(total_budget.clone());
             unlock_budget_by_round(
                 simulation_round,
                 slack,
                 n_total_steps,
                 &mut block,
-                &total_budget,
-                &unreduced_total_budget,
             );
             let x: f64 = odd_slack[0..=i].iter().sum();
             assert!(block
-                .unlocked_budget
-                .approx_eq(&_rdp_a2(x * share_a, x * share_b), F64Margin::default()));
-            assert!(block.unreduced_unlocked_budget.approx_eq(
-                &_rdp_a3(x * share_a, x * share_b, x * share_c),
-                F64Margin::default()
-            ));
+                .default_unlocked_budget
+                .unwrap()
+                .approx_eq(&_rdp_a3(x * share_a, x * share_b, x * share_c), F64Margin::default()));
         }
     }
 
@@ -652,32 +588,25 @@ mod tests {
 
         let simulation_round = RoundId(10);
 
-        let total_budget = _rdp_a2(
-            n_total_steps as f64 * share_a,
-            n_total_steps as f64 * share_b,
-        );
-        let unreduced_total_budget = _rdp_a3(
+        let total_budget = _rdp_a3(
             n_total_steps as f64 * share_a,
             n_total_steps as f64 * share_b,
             n_total_steps as f64 * share_c,
         );
 
         let mut block = _create_block(0);
+        block.default_total_budget = Some(total_budget.clone());
 
         unlock_budget_by_round(
             simulation_round,
             slack,
             n_total_steps,
             &mut block,
-            &total_budget,
-            &unreduced_total_budget,
         );
 
         assert!(block
-            .unlocked_budget
+            .default_unlocked_budget
+            .unwrap()
             .approx_eq(&total_budget, F64Margin::default()));
-        assert!(block
-            .unreduced_unlocked_budget
-            .approx_eq(&unreduced_total_budget, F64Margin::default()));
     }
 }

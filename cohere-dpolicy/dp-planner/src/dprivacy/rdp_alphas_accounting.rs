@@ -2,10 +2,13 @@ use crate::dprivacy::rdp_alphas_accounting::RdpAlphas::*;
 use crate::dprivacy::AlphaIndex;
 use float_cmp::{ApproxEq, F64Margin};
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::ops::{Add, AddAssign, Sub, SubAssign};
+use bincode::{Decode, Encode};
+use serde::de::{MapAccess, SeqAccess};
+use serde::ser::SerializeStruct;
 
-#[derive(Deserialize, Clone, Debug, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Deserialize, Serialize, Encode, Decode)]
 #[serde(untagged)]
 pub enum RdpAlphas {
     A1([f64; 1]),
@@ -66,9 +69,6 @@ pub(super) trait RdpAlphasAccounting: Sized {
     /// correspond to the present epsilon values, it is not possible to check that the
     /// alpha values of the inputs are indeed the same.
     fn check_same_type(&self, other: &Self) -> bool;
-
-    /// Only keeps the values at positions where the mask is true
-    fn reduce_alphas(&self, mask: &[bool]) -> Option<Self>;
 
     /// The implementation of [link](../trait.Accounting.html#tymethod.remaining_percentage) for
     /// rdp.
@@ -261,17 +261,6 @@ impl RdpAlphasAccounting for RdpAlphas {
             (A15(_), A15(_)) => true,
             (_, _) => false,
         }
-    }
-
-    fn reduce_alphas(&self, mask: &[bool]) -> Option<Self> {
-        let self_vec = self.to_vec();
-        assert_eq!(self_vec.len(), mask.len());
-        let reduced_self_vec = self_vec
-            .into_iter()
-            .zip(mask.iter())
-            .filter_map(|(alpha, keep)| if *keep { Some(alpha) } else { None })
-            .collect::<Vec<_>>();
-        Self::from_vec(reduced_self_vec)
     }
 
     fn remaining_ratios(&self, original_budget: &Self) -> RdpAlphasRatios {

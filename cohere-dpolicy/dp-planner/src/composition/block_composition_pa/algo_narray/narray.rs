@@ -1,5 +1,12 @@
-pub struct NArray<T> {
+use std::io::Write;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use bincode;
+use bincode::{Decode, Encode};
+
+#[derive(Encode, Decode,Clone)]
+pub struct NArray<T: 'static> {
     array: Vec<T>,
+
     pub dim: Dimension,
 }
 
@@ -139,7 +146,7 @@ pub enum Index {
     ),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Decode, Encode)]
 pub enum Dimension {
     D1 {
         n0: usize,
@@ -810,6 +817,11 @@ pub fn from_idx(idx: usize, dim: &Dimension) -> Index {
 }
 
 impl<T: Clone> NArray<T> {
+
+    pub fn size(&self) -> usize {
+        self.array.len()
+    }
+
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.array.iter()
     }

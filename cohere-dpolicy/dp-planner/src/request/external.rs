@@ -1,10 +1,7 @@
-use crate::dprivacy::rdp_alphas_accounting::RdpAlphas;
+use crate::dprivacy::privacy_unit::{MyIntervalSet, PrivacyUnit};
 use crate::dprivacy::Accounting;
-use crate::request::AdapterInfo;
 use crate::simulation::RoundId;
-use crate::{AccountingType, RequestAdapter};
-use probability::distribution::Bernoulli;
-use probability::distribution::Sample;
+use crate::AccountingType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -13,25 +10,29 @@ use std::path::PathBuf;
 
 use super::super::schema;
 use super::super::schema::DataValueLookup;
-use super::{ConjunctionBuilder, RequestBuilder, RequestId};
+use super::{AttributeId, ConjunctionBuilder, Dnf, RequestBuilder, RequestId};
 
 /// ExternalRequest is the serialized format of [super::Request].
 /// However, there also a few semantic
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExternalRequest {
     pub request_id: RequestId,
-    pub request_cost: Option<AccountingType>,
-    pub profit: Option<u64>,
-    pub dnf: Dnf,
-    pub n_users: Option<usize>,
-    // Note: Adapter info supplied from file will be ignored
-    pub(crate) adapter_info: Option<AdapterInfo>,
+    pub request_cost: HashMap<PrivacyUnit, AccountingType>,
+    pub privacy_unit_selection: HashMap<PrivacyUnit, MyIntervalSet>,
+    pub profit: u64,
+    pub dnf: ExternalDnf,
+
+    pub dnf_pa: Option<ExternalDnf>,
+    pub attributes: Option<Vec<String>>,
+    pub categories: Option<Vec<String>>,
+    pub relaxations: Option<Vec<String>>,
+
     /// identifies the round the request joins the system
-    pub created: Option<RoundId>,
+    pub created: RoundId,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct Dnf {
+pub struct ExternalDnf {
     pub(super) conjunctions: Vec<Conjunction>,
 }
 
@@ -59,6 +60,71 @@ trait ExternalPredicate<'a> {
         attr_name: &str,
         schema: &schema::Schema,
     ) -> Result<(super::AttributeId, super::Predicate), schema::SchemaError>;
+}
+
+
+impl ExternalDnf {
+
+    pub fn from_internal(dnf: &Dnf, schema: &schema::Schema) -> Self {
+
+        let confjunctions = dnf
+            .conjunctions
+            .iter()
+            .map(|conj| {
+                let predicates: HashMap<String, Predicate> = conj
+                    .predicates
+                    .iter()
+                    .enumerate()
+                    .map(|(attr_id, pred)| {
+                        (
+                            schema
+                                .attribute_name(attr_id)
+                                .expect("Couldn't get attribute name")
+                                .to_string(),
+                            pred.to_external(AttributeId(attr_id), schema)
+                                .expect("Couldn't convert predicate to external"),
+                        )
+                    })
+                    .collect();
+
+                Conjunction { predicates }
+            })
+            .collect();
+
+        ExternalDnf{
+            conjunctions: confjunctions,
+        }
+    }
+
+
+
+    pub fn to_internal(&self, schema: &schema::Schema) -> (super::Dnf, Vec<String>) {
+
+        let mut dnf = super::Dnf {
+            conjunctions: Vec::new(),
+        };
+
+        let mut missing_attributes: Vec<String> = Vec::new();
+        // convert external dnf -> internal dnf
+        for external_conjunction in self.conjunctions.iter() {
+            let mut conj_builder = ConjunctionBuilder::new(schema);
+
+            // convert predicates from external -> internal
+            for (name, external_pred) in external_conjunction.predicates.iter() {
+                match external_pred.to_internal(name, schema) {
+                    Ok(sol) => {
+                        let (attr_id, pred) = sol;
+                        conj_builder = conj_builder.and(attr_id, pred);
+                    }
+                    Err(_) => missing_attributes.push(name.to_string()),
+                }
+            }
+
+            dnf.conjunctions.push(conj_builder.build());
+        }
+
+        (dnf, missing_attributes)
+    }
 }
 
 impl<'a> ExternalPredicate<'a> for Predicate {
@@ -101,41 +167,26 @@ impl<'a> ExternalPredicate<'a> for Predicate {
 
 impl ExternalRequest {
     /// Returns the converted request, and a list of attributes which could not be converted
-    fn convert(&self, schema: &schema::Schema) -> (super::Request, Vec<String>) {
-        assert!(
-            self.n_users.is_some() && self.profit.is_some() && self.request_cost.is_some(),
-            "A request did not have n_users, a profit or request_cost set"
-        );
+    fn to_internal(&self, schema: &schema::Schema) -> (super::Request, Vec<String>) {
+
+        let request_cost: HashMap<PrivacyUnit, AccountingType> = schema.privacy_units.iter().map(|unit| (unit.clone(), self.request_cost.get(unit).expect("missing privacy unit for request").clone())).collect();
 
         let mut builder = RequestBuilder::new_full(
             self.request_id,
-            self.request_cost.as_ref().unwrap().clone(),
-            self.profit.unwrap(),
-            self.n_users.unwrap(),
+            request_cost,
+            self.privacy_unit_selection.clone(),
+            self.profit,
+            None,
             self.created,
             schema,
-            self.adapter_info
-                .clone()
-                .expect("External request did not have adapter_info"),
         );
 
-        let mut missing_attributes: Vec<String> = Vec::new();
         // convert external dnf -> internal dnf
-        for external_conjunction in self.dnf.conjunctions.iter() {
-            let mut conj_builder = ConjunctionBuilder::new(schema);
 
-            // convert predicates from external -> internal
-            for (name, external_pred) in external_conjunction.predicates.iter() {
-                match external_pred.to_internal(name, schema) {
-                    Ok(sol) => {
-                        let (attr_id, pred) = sol;
-                        conj_builder = conj_builder.and(attr_id, pred);
-                    }
-                    Err(_) => missing_attributes.push(name.to_string()),
-                }
-            }
+        let (internal_dnf, missing_attributes) = self.dnf.to_internal(schema);
 
-            builder = builder.or_conjunction(conj_builder.build());
+        for conj in internal_dnf.conjunctions.into_iter(){
+            builder = builder.or_conjunction(conj);
         }
 
         (builder.build(), missing_attributes)
@@ -155,35 +206,18 @@ pub fn parse_requests(filepath: PathBuf) -> Result<Vec<ExternalRequest>, Error> 
 }
 
 pub fn convert_requests(
-    mut requests: Vec<ExternalRequest>,
+    requests: Vec<ExternalRequest>,
     schema: &schema::Schema,
-    request_adapter: &mut RequestAdapter,
-    alphas: &Option<RdpAlphas>,
 ) -> Result<HashMap<RequestId, super::Request>, schema::SchemaError> {
-    // first, we apply the adapter to potentially "fill" any values that are still none
-    request_adapter.apply(&mut requests, alphas);
+
 
     // then we convert it to internal representation
     let mut internal_requests: HashMap<RequestId, super::Request> = HashMap::new();
     let mut all_missing_attributes: BTreeSet<String> = BTreeSet::new();
 
-    // bernoulli distribution with p=1/no_inverse_frac -> approx every no_inverse_frac request will have no pa
-    let bernoulli = request_adapter
-        .get_no_pa_inverse_frac()
-        .map(|inverse_frac| Bernoulli::new(1.0 / inverse_frac as f64));
 
     for r in requests.into_iter() {
-        let (mut converted, missing_attributes) = r.convert(schema);
-
-        if let Some(bernoulli) = bernoulli {
-            // roughly every inverse_frac-th request does not have any dnf
-            // -> sample from bernoulli
-            if bernoulli.sample(&mut request_adapter.source) == 1 {
-                converted.dnf = super::Dnf {
-                    conjunctions: vec![ConjunctionBuilder::new(schema).build()],
-                }
-            }
-        }
+        let (converted, missing_attributes) = r.to_internal(schema);
 
         let inserted = internal_requests.insert(converted.request_id, converted);
         assert!(inserted.is_none());
@@ -194,8 +228,8 @@ pub fn convert_requests(
     assert!(
         internal_requests
             .values()
-            .all(|req| schema.accounting_type.check_same_type(&req.request_cost)),
-        "Request and schema have different types of DP. Schema: {}, first request: {}",
+            .all(|req| req.request_cost.values().all(|cost| cost.check_same_type(&schema.accounting_type))),
+        "Request and schema have different types of DP. Schema: {}, first request: {:?}",
         schema.accounting_type,
         internal_requests.values().next().unwrap().request_cost
     );
@@ -212,22 +246,16 @@ pub fn convert_requests(
 
 #[cfg(test)]
 mod tests {
-    use crate::dprivacy::rdp_alphas_accounting::RdpAlphas::*;
+    use crate::config::BudgetTotal;
+    use crate::dprivacy::privacy_unit::PrivacyUnit;
     use crate::request::{external::parse_requests, load_requests, resource_path};
-    use crate::AccountingType::{EpsDp, Rdp};
-    use crate::{AccountingType, RequestAdapter};
-    use std::path::PathBuf;
-    use std::str::FromStr;
+
 
     static DEMO_REQUESTS: &str = "request_files/demo_requests.json";
     static CENSUS_REQUESTS: &str = "request_files/census_requests.json";
     static DEMO_SCHEMA: &str = "schema_files/demo_schema.json";
     static CENSUS_SCHEMA: &str = "schema_files/census_schema.json";
-    static REQUEST_DIRECTORY: &str = "./resources/test/request_files/";
-    static SEED: u128 = 1848;
-    static RDP_FIVE_ALPHAS: AccountingType = Rdp {
-        eps_values: A5([0f64; 5]),
-    };
+
 
     #[test]
     fn test_parse_demo_requests() {
@@ -243,138 +271,20 @@ mod tests {
 
     #[test]
     fn test_convert_demo_requests() {
+
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.; 5]),
+            convert_block_budgets: false,
+        };
+
+
         let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &RDP_FIVE_ALPHAS).unwrap();
+            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &budget, Some(1)).unwrap();
         let converted_request = load_requests(
             resource_path(DEMO_REQUESTS),
             &demo_schema,
-            &mut RequestAdapter::get_empty_adapter(),
-            &None,
         );
-        assert!(
-            converted_request.is_ok(),
-            "{}",
-            converted_request.err().unwrap().to_string()
-        );
-    }
-
-    #[test]
-    fn test_add_cost_later() {
-        let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &EpsDp { eps: 0.0 }).unwrap();
-
-        let requests_path_buf =
-            PathBuf::from_str(&(REQUEST_DIRECTORY.to_owned() + "demo_requests_no_cost.json"))
-                .expect("Constructing PathBuf Failed");
-        let adapter_path_buf =
-            PathBuf::from_str("./resources/test/adapter_configs/set_cost_only.json")
-                .expect("Constructing PathBuf Failed");
-        let mut adapter = RequestAdapter::new(adapter_path_buf, SEED);
-        let converted_request = load_requests(requests_path_buf, &demo_schema, &mut adapter, &None);
-        assert!(
-            converted_request.is_ok(),
-            "{}",
-            converted_request.err().unwrap().to_string()
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "A request did not have n_users, a profit or request_cost set")]
-    fn test_no_cost_added() {
-        let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &RDP_FIVE_ALPHAS).unwrap();
-
-        let requests_path_buf =
-            PathBuf::from_str(&(REQUEST_DIRECTORY.to_owned() + "demo_requests_no_cost.json"))
-                .expect("Constructing PathBuf Failed");
-        let adapter_path_buf =
-            PathBuf::from_str("./resources/test/adapter_configs/set_profit_only.json")
-                .expect("Constructing PathBuf Failed");
-        let mut adapter = RequestAdapter::new(adapter_path_buf, SEED);
-        let converted_request = load_requests(requests_path_buf, &demo_schema, &mut adapter, &None);
-        assert!(
-            converted_request.is_ok(),
-            "{}",
-            converted_request.err().unwrap().to_string()
-        );
-    }
-
-    #[test]
-    fn test_add_profit_later() {
-        let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &RDP_FIVE_ALPHAS).unwrap();
-
-        let requests_path_buf =
-            PathBuf::from_str(&(REQUEST_DIRECTORY.to_owned() + "demo_requests_no_profit.json"))
-                .expect("Constructing PathBuf Failed");
-        let adapter_path_buf =
-            PathBuf::from_str("./resources/test/adapter_configs/set_profit_only.json")
-                .expect("Constructing PathBuf Failed");
-        let mut adapter = RequestAdapter::new(adapter_path_buf, SEED);
-        let converted_request = load_requests(requests_path_buf, &demo_schema, &mut adapter, &None);
-        assert!(
-            converted_request.is_ok(),
-            "{}",
-            converted_request.err().unwrap().to_string()
-        );
-    }
-
-    #[test]
-    fn test_add_nusers_later() {
-        let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &RDP_FIVE_ALPHAS).unwrap();
-
-        let requests_path_buf =
-            PathBuf::from_str(&(REQUEST_DIRECTORY.to_owned() + "demo_requests_no_nusers.json"))
-                .expect("Constructing PathBuf Failed");
-        let adapter_path_buf =
-            PathBuf::from_str("./resources/test/adapter_configs/set_nblocks_only.json")
-                .expect("Constructing PathBuf Failed");
-        let mut adapter = RequestAdapter::new(adapter_path_buf, SEED);
-        let converted_request = load_requests(requests_path_buf, &demo_schema, &mut adapter, &None);
-        assert!(
-            converted_request.is_ok(),
-            "{}",
-            converted_request.err().unwrap().to_string()
-        );
-    }
-
-    #[test]
-    fn test_add_nusers_profit_and_cost_later() {
-        let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &EpsDp { eps: 0.0 }).unwrap();
-
-        let requests_path_buf = PathBuf::from_str(
-            &(REQUEST_DIRECTORY.to_owned() + "demo_requests_no_profit_cost_nusers.json"),
-        )
-        .expect("Constructing PathBuf Failed");
-        let adapter_path_buf =
-            PathBuf::from_str("./resources/test/adapter_configs/set_profit_cost_and_nblocks.json")
-                .expect("Constructing PathBuf Failed");
-        let mut adapter = RequestAdapter::new(adapter_path_buf, SEED);
-        let converted_request = load_requests(requests_path_buf, &demo_schema, &mut adapter, &None);
-        assert!(
-            converted_request.is_ok(),
-            "{}",
-            converted_request.err().unwrap().to_string()
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "A request did not have n_users, a profit or request_cost set")]
-    fn test_dont_add_cost_and_profit() {
-        let demo_schema =
-            crate::schema::load_schema(resource_path(DEMO_SCHEMA), &RDP_FIVE_ALPHAS).unwrap();
-
-        let requests_path_buf = PathBuf::from_str(
-            &(REQUEST_DIRECTORY.to_owned() + "demo_requests_no_profit_cost_nusers.json"),
-        )
-        .expect("Constructing PathBuf Failed");
-        let adapter_path_buf =
-            PathBuf::from_str("./resources/test/adapter_configs/set_nblocks_only.json")
-                .expect("Constructing PathBuf Failed");
-        let mut adapter = RequestAdapter::new(adapter_path_buf, SEED);
-        let converted_request = load_requests(requests_path_buf, &demo_schema, &mut adapter, &None);
         assert!(
             converted_request.is_ok(),
             "{}",
@@ -384,18 +294,21 @@ mod tests {
 
     #[test]
     fn test_convert_census_requests() {
+
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.; 13]),
+            convert_block_budgets: false,
+        };
         let census_schema = crate::schema::load_schema(
             resource_path(CENSUS_SCHEMA),
-            &Rdp {
-                eps_values: A13([0.; 13]),
-            },
+            &budget,
+            Some(1),
         )
         .unwrap();
         let converted_request = load_requests(
             resource_path(CENSUS_REQUESTS),
             &census_schema,
-            &mut RequestAdapter::get_empty_adapter(),
-            &None,
         );
         assert!(
             converted_request.is_ok(),
@@ -407,18 +320,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "Request and schema have different types of DP")]
     fn test_convert_census_requests_wrong_budget() {
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.; 10]),
+            convert_block_budgets: false,
+        };
         let census_schema = crate::schema::load_schema(
             resource_path(CENSUS_SCHEMA),
-            &Rdp {
-                eps_values: A10([0.; 10]),
-            },
+            &budget,
+            Some(1),
         )
         .unwrap();
         let converted_request = load_requests(
             resource_path(CENSUS_REQUESTS),
             &census_schema,
-            &mut RequestAdapter::get_empty_adapter(),
-            &None,
         );
         assert!(
             converted_request.is_ok(),

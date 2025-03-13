@@ -1,22 +1,24 @@
 pub mod budget;
+pub mod privacy_unit;
 pub mod rdp_alphas_accounting;
-pub mod rdpopt;
 
 use crate::dprivacy::rdp_alphas_accounting::*;
 use crate::dprivacy::AccountingType::*;
 use crate::dprivacy::RdpAlphas::*;
 use float_cmp::{ApproxEq, F64Margin};
 use rug::{ops::Pow, Float};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_aux::prelude::*;
 use std::fmt;
+use std::io::Write;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
-
+use serde::ser::SerializeStruct;
 // Structs and Enums
 
+use bincode;
 /// Holds an eps-dp, adp or rdp budget or cost. See [Accounting], [AdpAccounting] and
 /// [RdpAccounting] for methods to call on this enum.
-#[derive(Deserialize, Clone, Debug, PartialEq, PartialOrd, Serialize)]
+#[derive(Deserialize, Clone, Debug, PartialEq, PartialOrd, Serialize, bincode::Encode, bincode::Decode)]
 pub enum AccountingType {
     EpsDp {
         #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -32,6 +34,42 @@ pub enum AccountingType {
         eps_values: RdpAlphas,
     },
 }
+
+// impl Serialize for AccountingType {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: Serializer,
+//     {
+//         match self {
+//             EpsDp { eps } => {
+//                 let mut state = serializer.serialize_struct("EpsDp", 1)?;
+//                 state.serialize_field("eps", &eps.to_string())?;
+//                 state.end()
+//             }
+//             EpsDeltaDp { eps, delta } => {
+//                 let mut state = serializer.serialize_struct("EpsDeltaDp", 2)?;
+//                 state.serialize_field("eps", &eps.to_string())?;
+//                 state.serialize_field("delta", &delta.to_string())?;
+//                 state.end()
+//             }
+//             Rdp { eps_values } => {
+//                 let mut state = serializer.serialize_struct("Rdp", 1)?;
+//                 state.serialize_field("eps_values", eps_values)?;
+//                 state.end()
+//             }
+//         }
+//     }
+// }
+
+// // Bincode
+// impl<T> AccountingType{
+//     fn encode<W: Write>(&self, writer: &mut W) -> Result<()>
+//     where
+//         T: bincode::Encode, // or implement a custom encoding for `T`
+//     {
+//         bincode::serialize_into(writer, self)
+//     }
+// }
 
 // Custom Traits
 
@@ -138,6 +176,9 @@ pub trait AdpAccounting {
     /// computed rdp constraints hold, we know that the original constraints in approximate
     /// differential privacy also must hold.
     fn adp_to_rdp_budget(&self, alphas: &RdpAlphas) -> AccountingType;
+
+
+    fn rdp_to_adp(&self, alphas: &RdpAlphas, delta: f64) -> AccountingType ;
 }
 
 // Trait implementations for AccountingType
@@ -512,37 +553,19 @@ impl AdpAccounting for AccountingType {
             }
         }
     }
+
+    fn rdp_to_adp(&self, alphas: &RdpAlphas, delta: f64) -> AccountingType  {
+        match self {
+            Rdp { eps_values } => AccountingType::EpsDeltaDp {
+                eps: eps_values.to_vec().iter().zip(alphas.to_vec().iter()).map(|(epsilon_rdp, alpha)| epsilon_rdp + ((1. / delta).ln() / (alpha - 1.))).min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
+                delta: delta,
+            },
+            _ => panic!("Tried to convert non RDP budget ({:?}) to ADP", self)
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
-pub struct PerAlphaCostAndBudget {
-    pub(crate) alpha: f64,
-    costs: Vec<f64>,
-    budget: f64,
-}
 
-/// Used to set which kinds of alpha reductions in
-/// [calc_needed_alphas](rdpopt::RdpOptimization::calc_needed_alphas) should be applied.
-/// * budget_reduction: Removes alphas where the budget is zero
-/// * ratio_reduction: Removes any alpha where the cost/budget ratios are all worse than for some
-/// other alpha (see paper for correctness proof)
-/// * combinatorial_reduction: Removes any alpha which does not enable any new allocation
-/// possibility
-#[derive(Copy, Clone, Debug)]
-pub struct AlphaReductions {
-    pub(crate) budget_reduction: bool,
-    pub(crate) ratio_reduction: bool,
-    pub(crate) combinatorial_reduction: bool,
-}
-
-/// Used in [calc_needed_alphas](rdpopt::RdpOptimization::calc_needed_alphas) to return how many
-/// alphas were removed by which optimization (if the optimization was enabled)
-#[derive(Copy, Clone, Debug)]
-pub struct AlphaReductionsResult {
-    pub(crate) budget_reduction: Option<usize>,
-    pub(crate) ratio_reduction: Option<usize>,
-    pub(crate) combinatorial_reduction: Option<usize>,
-}
 
 impl AccountingType {
     /// Converts a budget in adp to rdp. See [AccountingType::adp_to_rdp_budget] for more

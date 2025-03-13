@@ -7,6 +7,7 @@ gurobi/__pycache__/user_info_generator.cpython-38.pyc
 data/
 temp/
 # applications/
+dp-planner/results
 
 delta-lake/
 

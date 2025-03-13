@@ -4,20 +4,19 @@
 
 use crate::composition::{CompositionConstraint, ProblemFormulation};
 use crate::config::{Budget, BudgetTotal, BudgetType, CompositionConfig, SegmentationAlgo};
+use crate::dprivacy::privacy_unit::PrivacyUnit;
 use crate::request::{
-    AttributeId, ConjunctionBuilder, Predicate, Request, RequestBuilder, RequestId,
+    AttributeId, ConjunctionBuilder, Predicate, Request, RequestBuilder, RequestId
 };
 use crate::schema::{Attribute, Schema, ValueDomain};
-use crate::BlockId::User;
 use crate::{AccountingType, Block, BlockId, OptimalBudget, RoundId};
 use itertools::Itertools;
 use log::trace;
 use rayon::ThreadPoolBuildError;
 use std::cmp::min;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
+
+
 
 /// The path of the census schema relative to resources/test
 #[allow(dead_code)]
@@ -56,6 +55,8 @@ pub fn build_dummy_schema(dp_type: AccountingType) -> Schema {
 
     Schema {
         accounting_type: dp_type,
+        privacy_units: HashSet::from([PrivacyUnit::User]),
+        block_sliding_window_size: 12,
         attributes,
         name_to_index: HashMap::new(),
     }
@@ -77,18 +78,23 @@ pub fn build_dummy_schema(dp_type: AccountingType) -> Schema {
 #[allow(dead_code)]
 pub fn build_dummy_requests_with_pa(
     schema: &Schema,
-    n_users: usize,
+    n_blocks: usize,
     request_cost: AccountingType,
     n_requests: usize,
 ) -> HashMap<RequestId, Request> {
+
+    let unit_selection = HashMap::new();
+
+    let num_blocks = Some(n_blocks);
+
     let mut requests = vec![
         RequestBuilder::new(
             RequestId(0),
-            request_cost.clone(),
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -98,11 +104,11 @@ pub fn build_dummy_requests_with_pa(
         .build(),
         RequestBuilder::new(
             RequestId(1),
-            request_cost.clone(),
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -112,11 +118,11 @@ pub fn build_dummy_requests_with_pa(
         .build(),
         RequestBuilder::new(
             RequestId(2),
-            request_cost.clone(),
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -127,11 +133,11 @@ pub fn build_dummy_requests_with_pa(
         .build(),
         RequestBuilder::new(
             RequestId(3),
-            request_cost.clone(),
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -141,11 +147,11 @@ pub fn build_dummy_requests_with_pa(
         .build(),
         RequestBuilder::new(
             RequestId(4),
-            request_cost.clone(),
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -161,11 +167,11 @@ pub fn build_dummy_requests_with_pa(
         .build(),
         RequestBuilder::new(
             RequestId(5),
-            request_cost.clone(),
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -176,11 +182,11 @@ pub fn build_dummy_requests_with_pa(
         .build(),
         RequestBuilder::new(
             RequestId(6),
-            request_cost,
+            HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+            unit_selection.clone(),
             1,
-            n_users,
+            num_blocks.clone(),
             schema,
-            Default::default(),
         )
         .or_conjunction(
             ConjunctionBuilder::new(schema)
@@ -205,7 +211,7 @@ pub fn build_dummy_requests_with_pa(
 #[allow(dead_code)]
 pub fn build_dummy_requests_no_pa(
     schema: &Schema,
-    n_users: usize,
+    n_blocks: usize,
     request_cost: AccountingType,
     n_requests: usize,
 ) -> HashMap<RequestId, Request> {
@@ -213,43 +219,16 @@ pub fn build_dummy_requests_no_pa(
         .map(|i| {
             RequestBuilder::new(
                 RequestId(i),
-                request_cost.clone(),
+                HashMap::from([(PrivacyUnit::User, request_cost.clone())]),
+                HashMap::new(),
                 1,
-                n_users,
+                Some(n_blocks),
                 schema,
-                Default::default(),
             )
             .build()
         })
         .map(|request| (request.request_id, request))
         .collect()
-}
-
-/// Generates blocks via [generate_blocks], and then writes these blocks to the given path.
-pub fn generate_and_write_blocks(
-    start: usize,
-    end: usize,
-    budget: AccountingType,
-    path: &Path,
-) -> Result<(), std::io::Error> {
-    let blocks = generate_blocks(start, end, budget)
-        .into_iter()
-        .map(|(_, block)| crate::block::external::ExternalBlock {
-            id: block.id,
-            request_ids: block.request_history,
-            unlocked_budget: block.unlocked_budget,
-            created: block.created,
-            retired: block.retired,
-        })
-        .collect::<Vec<_>>();
-    let stringify = if (end - start) == 1 {
-        serde_json::to_string_pretty(&blocks)?
-    } else {
-        serde_json::to_string(&blocks)?
-    };
-    let mut file = File::create(path)?;
-    file.write_all(stringify.as_ref())?;
-    Ok(())
 }
 
 /// Generates blocks with ids start..end, given budget as unlocked_budget, empty request histories
@@ -258,16 +237,20 @@ pub fn generate_blocks(
     start: usize,
     end: usize,
     unlocked_budget: AccountingType,
+    total_budget: AccountingType,
 ) -> HashMap<BlockId, Block> {
     (start..end)
         .map(|num| {
             (
-                User(num),
+                BlockId(num),
                 Block {
-                    id: User(num),
+                    id: BlockId(num),
+                    privacy_unit: PrivacyUnit::User,
+                    privacy_unit_selection: None,
                     request_history: vec![],
-                    unlocked_budget: unlocked_budget.clone(),
-                    unreduced_unlocked_budget: unlocked_budget.clone(),
+                    default_unlocked_budget: Some(unlocked_budget.clone()),
+                    default_total_budget: Some(total_budget.clone()),
+                    budget_by_section: Vec::new(),
                     created: RoundId(0),
                     retired: None,
                 },
@@ -279,14 +262,14 @@ pub fn generate_blocks(
 /// Constructs a problem formulation and then replays the given allocation on top of it
 pub fn construct_pf_and_replay_allocation(
     blocks: &HashMap<BlockId, Block>,
-    candidate_requests: &HashMap<RequestId, Request>,
+    candidate_requests: &BTreeMap<RequestId, Request>,
     history_requests: &HashMap<RequestId, Request>,
     schema: &Schema,
     ilp_allocated_requests: &Vec<RequestId>,
     accepted_requests: &BTreeMap<RequestId, HashSet<BlockId>>,
 ) {
     let block_composition = crate::composition::block_composition_pa::build_block_part_attributes(
-        SegmentationAlgo::Narray,
+        SegmentationAlgo::Narray, None
     );
 
     let mut pf: ProblemFormulation<OptimalBudget> = block_composition
@@ -296,6 +279,7 @@ pub fn construct_pf_and_replay_allocation(
             history_requests,
             schema,
             &mut Vec::new(),
+            &mut HashMap::new(),
         );
 
     for rid in ilp_allocated_requests {
@@ -317,24 +301,9 @@ pub fn get_dummy_composition() -> CompositionConfig {
     CompositionConfig::BlockComposition {
         budget: Budget::FixBudget {
             budget: BudgetTotal {
-                budget_file: None,
-                epsilon: None,
-                delta: None,
-                rdp1: None,
-                rdp2: None,
-                rdp3: None,
-                rdp4: None,
-                rdp5: None,
-                rdp7: None,
-                rdp10: None,
-                rdp13: None,
-                rdp14: None,
-                rdp15: None,
                 alphas: None,
-                no_global_alpha_reduction: false,
-                convert_candidate_request_costs: false,
-                convert_history_request_costs: false,
                 convert_block_budgets: false,
+                privacy_units: Some(vec![PrivacyUnit::User]),
             },
         },
         budget_type: BudgetType::OptimalBudget,

@@ -8,6 +8,7 @@ pub mod util;
 use log::{info, trace};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Add, AddAssign, Sub};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::allocation::AllocationStatus;
@@ -17,13 +18,12 @@ use crate::logging::{RuntimeKind, RuntimeMeasurement};
 use crate::{
     allocation::{AllocationRound, ResourceAllocation},
     block::Block,
-    config::Budget,
-    global_reduce_alphas, logging,
+    logging,
     request::{Request, RequestId},
-    schema::Schema,
-    AlphaReductionsResult, Cli, Rdp, RdpAccounting,
+    schema::Schema, Cli,
 };
 use serde::{Deserialize, Serialize};
+use crate::composition::block_composition_pa::NArrayCache;
 
 /// Contains various information needed to run the simulation. See the documentation about the
 /// individual fields for more information.
@@ -37,9 +37,6 @@ pub struct SimulationConfig {
     /// for allocation later. The information how many times it was already considered is lost in
     /// this case.
     pub(crate) timeout_rounds: usize,
-    /// The same as [budget_config](struct.SimulationConfig.html#structfield.budget_config), except
-    /// that the alphas are not reduced from global alpha reduction.
-    pub(crate) unreduced_budget_config: Budget,
     /// The round in which the simulation starts. This is important if the [budget](Budget) is an
     /// [unlocking budget](Budget::UnlockingBudget), as how much budget is unlocked depends on the
     /// current round and on when a block was created.
@@ -76,8 +73,8 @@ pub struct RequestCollection {
 
 #[derive(Deserialize, Debug, Clone, Copy, Hash, Serialize)]
 pub enum BatchingStrategy {
-    ByBatchSize(usize),
     ByRequestCreated,
+    ByBatchSize(usize),
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -105,24 +102,12 @@ impl Sub for RoundId {
     }
 }
 
-impl RequestCollection {
-    /// This method resets the unlocked budget to contain again all alphas
-    pub fn unreduce_alphas(&mut self) {
-        for request in self.sorted_candidates.iter_mut() {
-            request.unreduce_alphas();
-        }
-        for request in self.request_history.values_mut() {
-            request.unreduce_alphas();
-        }
-        for request in self.rejected_requests.values_mut() {
-            request.unreduce_alphas();
-        }
-        for request in self.remaining_requests.values_mut() {
-            request.unreduce_alphas();
-        }
+
+impl RoundId{
+    pub fn to_usize(&self) -> usize {
+        self.0
     }
 }
-
 pub fn run_simulation(
     request_collection: &mut RequestCollection,
     blocks: &mut HashMap<BlockId, Block>,
@@ -146,6 +131,22 @@ pub fn run_simulation(
     let mut runtime_logger =
         csv::Writer::from_path(&simulation_config.output_paths.runtime_log_output_path)
             .expect("Couldn't open runtime logger output file");
+
+    // Clear applied_request cache
+    let cache_requests = std::env::var("CACHE_REQUEST_COST").unwrap_or("0".to_string());
+    if cache_requests == "1" {
+        println!("Clearing request cost cache");
+        let tmp_dir = std::env::temp_dir();
+        if tmp_dir.exists() {
+            for block in blocks.keys() {
+                let tmp_file_path = tmp_dir.join(format!("cum_request_cost_{block}.bin"));
+                if tmp_file_path.exists() {
+                    println!("Removing file: {:?}", tmp_file_path);
+                    std::fs::remove_file(tmp_file_path).unwrap();
+                }
+            }
+        }
+    }
 
     // The current round in the simulation. Note that for online allocation methods (like greedy),
     // one simulation round might correspond to multiple allocation rounds.
@@ -172,15 +173,8 @@ pub fn run_simulation(
     // blocks: contains all blocks with a created field < simulation_round
     // blocks_per_round contains all blocks with a created field >= simulation_round (grouped by round)
 
-    // check that candidate requests each need >= 1 block
-    assert!(request_collection
-        .sorted_candidates
-        .iter()
-        .all(|req| req.n_users > 0));
-
     let orig_n_candidates = request_collection.sorted_candidates.len();
     let orig_history_size = request_collection.request_history.len();
-    let orig_config_and_schema = config_and_schema.clone();
 
     let mut curr_candidate_requests: BTreeMap<RequestId, Request> = BTreeMap::new();
 
@@ -189,6 +183,9 @@ pub fn run_simulation(
     let rounds_instant: Instant = Instant::now();
 
     let mut total_profit = 0u64;
+
+    // TODO: Delete block cache when done with block
+    let block_narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>> = &mut HashMap::new();
 
     loop {
         let mut round_total_meas = RuntimeMeasurement::start(RuntimeKind::TotalRound);
@@ -212,17 +209,6 @@ pub fn run_simulation(
             break;
         }
 
-        // remove global alpha reduction from prior round
-        *config_and_schema = orig_config_and_schema.clone();
-        let budget = config_and_schema.config.total_budget().budget();
-        request_collection.unreduce_alphas();
-        for (_, req) in curr_candidate_requests.iter_mut() {
-            req.unreduce_alphas();
-        }
-        for block in blocks.values_mut() {
-            block.unreduce_alphas();
-        }
-
         // move the new batch of requests from request.collection.sorted_candidates to curr_candidate_requests
         let (newly_available_requests, is_final_round) = util::pre_round_request_batch_update(
             simulation_round,
@@ -239,41 +225,17 @@ pub fn run_simulation(
         util::update_block_unlocked_budget(
             blocks,
             config_and_schema.config.allocation().budget_config(),
-            &simulation_config.unreduced_budget_config,
-            newly_available_requests.len(),
             simulation_round,
         );
 
-        // Determine which alphas are actually needed, if we have rdp
-        let global_alpha_red_res: Option<AlphaReductionsResult> = if budget.is_rdp()
-            && config_and_schema
-                .config
-                .total_budget()
-                .global_alpha_reduction()
-        {
-            let res = global_reduce_alphas(
-                &mut config_and_schema.config,
-                &budget,
-                &mut config_and_schema.schema,
-                &mut curr_candidate_requests,
-                &mut request_collection.request_history,
-                blocks,
-            );
-            Some(res)
-        } else {
-            None
-        };
-
-        // Adjust max budget used to calculate dominant share
-        let budget = config_and_schema.config.total_budget().budget();
-        if let AllocationRound::Dpf(dpf, _, _) = allocator {
-            dpf.max_budget = budget;
-        }
 
         trace!(
             "Current candidate requests: {:?}",
             &curr_candidate_requests.keys()
         );
+
+        //let expected_num_active_blocks = config_and_schema.schema.block_sliding_window_size * config_and_schema.schema.privacy_units.len();
+        //assert!(blocks.len() == expected_num_active_blocks, "Round: {:?}   Expected number of active blocks: {:?}, actual number of active blocks: {:?}", simulation_round, expected_num_active_blocks, blocks.len());
 
         info!("Starting allocation in round={:?} n_blocks={:?} n_candidate_requests={:?}   n_request_allocated_until_now={:?}", simulation_round, blocks.len(), curr_candidate_requests.len(), request_collection.request_history.len());
 
@@ -286,17 +248,10 @@ pub fn run_simulation(
             .round(
                 &request_collection.request_history,
                 blocks,
-                &curr_candidate_requests
-                    .iter()
-                    .map(|(rid, req)| (*rid, req.clone()))
-                    .collect(),
+                &mut curr_candidate_requests,
                 &config_and_schema.schema,
-                &config_and_schema
-                    .config
-                    .total_budget()
-                    .alphas()
-                    .map(|alphas| Rdp { eps_values: alphas }),
                 &mut runtime_measurements,
+                block_narray_cache
             );
         runtime_measurements.push(round_allocation_meas.stop());
         runtime_measurements.push(round_total_meas.stop());
@@ -312,7 +267,6 @@ pub fn run_simulation(
             is_final_round,
             &assignment,
             &*config_and_schema,
-            &allocation_status,
             &request_start_rounds,
         );
 
@@ -321,14 +275,12 @@ pub fn run_simulation(
             simulation_round,
             simulation_config,
             config_and_schema,
-            &orig_config_and_schema,
             newly_available_requests,
             BTreeSet::from_iter(assignment.accepted.keys().copied()),
             allocation_status,
             config_and_schema.config.allocation(),
             &request_collection.request_history,
             &*blocks,
-            global_alpha_red_res,
         );
 
         logging::write_runtime_log(
@@ -366,350 +318,5 @@ pub fn run_simulation(
 
 #[cfg(test)]
 mod tests {
-    use crate::config::Mode::Simulate;
-    use crate::config::{
-        AllocationConfig, Budget, BudgetTotal, BudgetType, CompositionConfig, Input, OutputConfig,
-        OutputPaths, RequestAdapterConfig, UnlockingBudgetTrigger,
-    };
-    use crate::request::RequestBuilder;
-    use crate::schema::Schema;
-    use crate::simulation::RequestCollection;
-    use crate::util::{self, generate_blocks};
-    use crate::AccountingType::EpsDp;
-    use crate::{
-        allocation, simulation, AccountingType, Cli, ConfigAndSchema, Request, RequestId, RoundId,
-        SimulationConfig,
-    };
-    use itertools::Itertools;
-    use std::collections::{BTreeMap, HashMap};
-    use std::path::PathBuf;
-    use std::str::FromStr;
 
-    use super::BatchingStrategy;
-
-    fn to_request_id(vec: Vec<usize>) -> Vec<RequestId> {
-        vec.into_iter().map(RequestId).collect()
-    }
-
-    const EPS1_4: BudgetTotal = BudgetTotal {
-        budget_file: None,
-        epsilon: Some(1.4),
-        delta: None,
-        rdp1: None,
-        rdp2: None,
-        rdp3: None,
-        rdp4: None,
-        rdp5: None,
-        rdp7: None,
-        rdp10: None,
-        rdp13: None,
-        rdp14: None,
-        rdp15: None,
-        alphas: None,
-        no_global_alpha_reduction: false,
-        convert_candidate_request_costs: false,
-        convert_history_request_costs: false,
-        convert_block_budgets: false,
-    };
-
-    #[test]
-    fn test_dpf_ordered_dpf_no_pa_keep_rejected_unlocking_budget_1() {
-        let budgets_and_blocks = [
-            (EpsDp { eps: 0.9 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 0.4 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-        ];
-        let candidate_requests = build_dummy_requests_no_pa(budgets_and_blocks);
-        let accepted_gt = to_request_id(vec![0, 4]);
-
-        let budget_total = EPS1_4.clone();
-
-        let budget = Budget::UnlockingBudget {
-            trigger: UnlockingBudgetTrigger::Request,
-            n_steps: 3,
-            budget: budget_total,
-            slack: None,
-        };
-
-        let timeout_rounds = candidate_requests.len();
-
-        run_dpf_simulation_no_pa(candidate_requests, &accepted_gt, timeout_rounds, budget);
-    }
-
-    #[test]
-    fn test_dpf_ordered_dpf_no_pa_keep_rejected_unlocking_budget_2() {
-        let budgets_and_blocks = [
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 0.9 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 0.4 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-        ];
-        let candidate_requests = build_dummy_requests_no_pa(budgets_and_blocks);
-        let accepted_gt = to_request_id(vec![2, 4]);
-
-        let budget_total = EPS1_4.clone();
-
-        let budget = Budget::UnlockingBudget {
-            trigger: UnlockingBudgetTrigger::Request,
-            n_steps: 3,
-            budget: budget_total,
-            slack: None,
-        };
-
-        let timeout_rounds = candidate_requests.len();
-
-        run_dpf_simulation_no_pa(candidate_requests, &accepted_gt, timeout_rounds, budget);
-    }
-
-    #[test]
-    fn test_dpf_ordered_dpf_no_pa_throw_rejected_unlocking_budget_1() {
-        let budgets_and_blocks = [
-            (EpsDp { eps: 0.9 }, 3),
-            (EpsDp { eps: 0.95 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 0.4 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-        ];
-        let candidate_requests = build_dummy_requests_no_pa(budgets_and_blocks);
-        let accepted_gt = to_request_id(vec![2, 4]);
-
-        let budget_total = EPS1_4.clone();
-
-        let budget = Budget::UnlockingBudget {
-            trigger: UnlockingBudgetTrigger::Request,
-            n_steps: 3,
-            budget: budget_total,
-            slack: None,
-        };
-
-        run_dpf_simulation_no_pa(candidate_requests, &accepted_gt, 1, budget);
-    }
-
-    #[test]
-    fn test_dpf_ordered_dpf_no_pa_throw_rejected_unlocking_budget_2() {
-        let budgets_and_blocks = [
-            (EpsDp { eps: 1.5 }, 3),
-            (EpsDp { eps: 1.5 }, 3),
-            (EpsDp { eps: 1.5 }, 3),
-            (EpsDp { eps: 1.5 }, 3),
-            (EpsDp { eps: 0.4 }, 3),
-            (EpsDp { eps: 1.5 }, 3),
-        ];
-        let candidate_requests = build_dummy_requests_no_pa(budgets_and_blocks);
-        let accepted_gt = to_request_id(vec![4]);
-
-        let budget_total = EPS1_4.clone();
-
-        let budget = Budget::UnlockingBudget {
-            trigger: UnlockingBudgetTrigger::Request,
-            n_steps: 3,
-            budget: budget_total,
-            slack: None,
-        };
-
-        run_dpf_simulation_no_pa(candidate_requests, &accepted_gt, 1, budget);
-    }
-
-    #[test]
-    fn test_dpf_ordered_dpf_no_pa_keep_rejected_fix_budget_1() {
-        let budgets_and_blocks = [
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 0.9 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-            (EpsDp { eps: 0.4 }, 3),
-            (EpsDp { eps: 1.0 }, 3),
-        ];
-        let candidate_requests = build_dummy_requests_no_pa(budgets_and_blocks);
-        let accepted_gt = to_request_id(vec![0, 4]);
-
-        let budget_total = EPS1_4.clone();
-
-        let budget = Budget::FixBudget {
-            budget: budget_total,
-        };
-
-        let timeout_rounds = candidate_requests.len();
-
-        run_dpf_simulation_no_pa(candidate_requests, &accepted_gt, timeout_rounds, budget);
-    }
-
-    fn run_dpf_simulation_no_pa(
-        candidate_requests: HashMap<RequestId, Request>,
-        accepted_gt: &[RequestId],
-        timeout_rounds: usize,
-        budget: Budget,
-    ) {
-        let empty_schema = Schema {
-            accounting_type: EpsDp { eps: -1.0 },
-            attributes: vec![],
-            name_to_index: Default::default(),
-        };
-
-        let output_paths = OutputPaths {
-            req_log_output_path: PathBuf::from_str("results/requests.csv")
-                .expect("Constructing PathBuf failed"),
-            round_log_output_path: PathBuf::from_str("results/rounds.csv")
-                .expect("Constructing PathBuf failed"),
-            runtime_log_output_path: PathBuf::from_str("results/runtime.csv")
-                .expect("Constructing PathBuf failed"),
-            stats_output_path: PathBuf::from_str("results/stats.json")
-                .expect("Constructing PathBuf failed"),
-            history_output_directory_path: None,
-        };
-
-        let allocation_config: AllocationConfig = AllocationConfig::Dpf {
-            block_selector_seed: 42u64,
-            weighted_dpf: false,
-            dominant_share_by_remaining_budget: false,
-            composition: CompositionConfig::BlockComposition {
-                budget: budget.clone(),
-                budget_type: BudgetType::OptimalBudget,
-            },
-        };
-
-        let config = Cli {
-            mode: Simulate {
-                allocation: allocation_config.clone(),
-                batch_size: Some(1),
-                timeout_rounds,
-                max_requests: None,
-            },
-            input: Input {
-                schema: Default::default(),
-                blocks: Default::default(),
-                requests: Default::default(),
-                request_adapter_config: RequestAdapterConfig {
-                    request_adapter: None,
-                    request_adapter_seed: None,
-                },
-                history: Default::default(),
-            },
-            output_config: OutputConfig {
-                req_log_output: Default::default(),
-                round_log_output: Default::default(),
-                runtime_log_output: Default::default(),
-                log_remaining_budget: false,
-                log_nonfinal_rejections: false,
-                stats_output: Default::default(),
-                history_output_directory: None,
-            },
-        };
-
-        let simulation_config = SimulationConfig {
-            batching_strategy: BatchingStrategy::ByBatchSize(1),
-            timeout_rounds,
-            unreduced_budget_config: budget,
-            start_round: RoundId(0),
-            output_paths,
-            log_nonfinal_rejections: false,
-        };
-
-        let mut config_and_schema = ConfigAndSchema {
-            config,
-            schema: empty_schema,
-        };
-
-        let mut blocks = generate_blocks(0, 5, EpsDp { eps: 0.0 });
-
-        let accepted = BTreeMap::new();
-        let rejected_requests = BTreeMap::new();
-        let request_history = HashMap::new();
-
-        let sorted_candidates: Vec<Request> = candidate_requests
-            .into_iter()
-            .map(|(_, request)| request)
-            .sorted_by(|r1, r2| Ord::cmp(&r1.request_id, &r2.request_id))
-            .collect();
-
-        let mut allocator = allocation::construct_allocator(&allocation_config);
-
-        let rejected_gt = &sorted_candidates
-            .iter()
-            .filter_map(|req| {
-                if !accepted_gt.contains(&req.request_id) {
-                    Some(req.request_id)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut request_collection = RequestCollection {
-            sorted_candidates,
-            request_history,
-            rejected_requests,
-            accepted,
-            remaining_requests: BTreeMap::new(),
-        };
-
-        simulation::run_simulation(
-            &mut request_collection,
-            &mut blocks,
-            &mut allocator,
-            &simulation_config,
-            &mut config_and_schema,
-        );
-
-        check_requests(
-            &request_collection
-                .accepted
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            accepted_gt,
-            &request_collection
-                .rejected_requests
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            rejected_gt,
-        );
-    }
-
-    fn check_requests(
-        accepted: &[RequestId],
-        accepted_gt: &[RequestId],
-        rejected: &[RequestId],
-        rejected_gt: &[RequestId],
-    ) {
-        assert_eq!(
-            accepted.iter().sorted().collect::<Vec<_>>(),
-            accepted_gt.iter().sorted().collect::<Vec<_>>(),
-            "Accepted requests deviate from ground truth (left: calculated, right: ground truth)"
-        );
-        assert_eq!(
-            rejected.iter().sorted().collect::<Vec<_>>(),
-            rejected_gt.iter().sorted().collect::<Vec<_>>(),
-            "Rejected requests deviate from ground truth (left: calculated, right: ground truth)"
-        );
-    }
-
-    fn build_dummy_requests_no_pa<const N: usize>(
-        budgets_and_blocks: [(AccountingType, usize); N],
-    ) -> HashMap<RequestId, Request> {
-        let schema = util::build_dummy_schema(EpsDp { eps: 1.0 });
-        let mut res: HashMap<RequestId, Request> = HashMap::with_capacity(N);
-        for (i, (cost, n_users)) in budgets_and_blocks.into_iter().enumerate() {
-            let req = RequestBuilder::new(
-                RequestId(i),
-                cost.clone(),
-                1,
-                n_users,
-                &schema,
-                Default::default(),
-            )
-            .build();
-
-            let inserted = res.insert(req.request_id, req);
-            assert!(inserted.is_none());
-        }
-        res
-    }
 }

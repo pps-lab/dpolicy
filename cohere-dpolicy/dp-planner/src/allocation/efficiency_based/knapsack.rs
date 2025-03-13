@@ -2,12 +2,11 @@
 //!
 //! Algorithms are based on the book "Knapsack problems" by Kellerer, Pferschy, and Pisinger (2004),
 //! henceforth referred to as KPBook.
-
+//!
 use crate::allocation::efficiency_based::knapsack::knapsack_private::KPApproxSolverInt;
 
-use crate::allocation::ilp::ILP_INTEGRALITY_MARGIN;
 use crate::request::RequestId;
-use float_cmp::ApproxEq;
+use float_cmp::{ApproxEq, F64Margin};
 use grb::expr::LinExpr;
 use grb::prelude::*;
 use itertools::Itertools;
@@ -18,6 +17,16 @@ use std::collections::HashMap;
 use std::convert::From;
 use std::fmt;
 use std::fmt::Debug;
+
+
+/// When assigning values to binary variables, gurobi doesn't always assign 0 or 1, it may also
+/// assign a value "close" to one of these values, e.g., 1e-5 is fine. To take this into account,
+/// we define an integrality margin with the same limits as used by gurobi, to check the resulting
+/// assignments by gurobi.
+pub static ILP_INTEGRALITY_MARGIN: F64Margin = F64Margin {
+    epsilon: 1e-5,
+    ulps: 0,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KPItem {

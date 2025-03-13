@@ -1,7 +1,8 @@
 use itertools::Itertools;
-use std::collections::{HashMap, HashSet};
-
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use crate::composition::ProblemFormulation;
+use crate::dprivacy::privacy_unit::is_selected_block;
 use crate::logging::RuntimeMeasurement;
 use crate::{
     block::{Block, BlockId},
@@ -10,7 +11,7 @@ use crate::{
     request::{Request, RequestId},
     schema::Schema,
 };
-
+use crate::composition::block_composition_pa::NArrayCache;
 use super::{BlockConstraints, CompositionConstraint};
 
 pub struct BlockComposition {}
@@ -23,11 +24,21 @@ impl CompositionConstraint for BlockComposition {
     fn build_problem_formulation<M: SegmentBudget>(
         &self,
         blocks: &HashMap<BlockId, Block>,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &BTreeMap<RequestId, Request>,
         history_requests: &HashMap<RequestId, Request>,
         _schema: &Schema,
         _runtime_measurements: &mut Vec<RuntimeMeasurement>,
+        _block_narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>>
     ) -> ProblemFormulation<M> {
+
+
+        for (_, b) in blocks.iter(){
+            for (_, r) in candidate_requests.iter(){
+                assert!(is_selected_block(r, b), "At the moment for block compoisiton without PA, we only correctly support the case where all requests, select all blocks.");
+            }
+        }
+
+
         let block_constraints: HashMap<BlockId, BlockConstraints<M>> = blocks
             .iter()
             .map(|(block_id, block)| {
@@ -37,20 +48,20 @@ impl CompositionConstraint for BlockComposition {
                         block,
                         history_requests,
                         candidate_requests,
-                        block.unlocked_budget.clone(),
+                        block.default_unlocked_budget.clone().expect("For block_composition (without pa), the unlocked budget needs to be set"),
                     ),
                 )
             })
             .collect();
 
-        ProblemFormulation::new(block_constraints, candidate_requests)
+        ProblemFormulation::new(block_constraints, candidate_requests, blocks)
     }
 }
 
 fn build_block_constraint<M: SegmentBudget>(
     block: &Block,
     history: &HashMap<RequestId, Request>,
-    candidate_requests: &HashMap<RequestId, Request>,
+    candidate_requests: &BTreeMap<RequestId, Request>,
     budget: AccountingType,
 ) -> BlockConstraints<M> {
     let block_history_cost = block
@@ -60,7 +71,7 @@ fn build_block_constraint<M: SegmentBudget>(
             history
                 .get(request_id)
                 .expect("missing request")
-                .request_cost
+                .request_cost(&block.privacy_unit)
                 .clone()
         })
         .reduce(|agg, item| agg + item);
@@ -75,12 +86,18 @@ fn build_block_constraint<M: SegmentBudget>(
 
     let (candidates, rejected): (Vec<&Request>, Vec<&Request>) = candidate_requests
         .values()
-        .partition(|request| remaining_budget.is_budget_sufficient(&request.request_cost));
+        .partition(|request| remaining_budget.is_budget_sufficient(request.request_cost(&block.privacy_unit)));
 
-    let request_cost_sum = candidates
+
+
+    let request_cost_sum: Option<AccountingType> = candidates
         .iter()
-        .map(|request| request.request_cost.clone())
-        .reduce(|agg, item| agg + item);
+        .map(|request| request.request_cost(&block.privacy_unit))
+        .fold(None, |agg, other|{
+            match agg {
+                        None => Some(other.clone()),
+                        Some(c_acc) => Some(c_acc + other),
+                    }});
 
     let candidate_request_ids: HashSet<RequestId> =
         candidates.iter().map(|r| r.request_id).collect();

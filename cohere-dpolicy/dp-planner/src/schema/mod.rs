@@ -1,4 +1,6 @@
-use crate::dprivacy::Accounting;
+use crate::config::BudgetTotal;
+use crate::dprivacy::privacy_unit::PrivacyUnit;
+use crate::dprivacy::rdp_alphas_accounting::{PubRdpAccounting, RdpAlphas};
 use crate::request::{ConjunctionBuilder, RequestBuilder};
 use crate::AccountingType::EpsDp;
 use crate::RequestId;
@@ -13,10 +15,17 @@ use std::path::PathBuf;
 
 use super::dprivacy::AccountingType;
 
+
+
 // TODO [later]: should be called something like blocking schema, accounting schema or something like that to avoid confusion with "full data schema"
 #[derive(Clone)]
 pub struct Schema {
     pub accounting_type: AccountingType,
+
+    pub privacy_units: HashSet<PrivacyUnit>,
+
+    pub block_sliding_window_size: usize,
+
     pub attributes: Vec<Attribute>,
 
     pub name_to_index: HashMap<String, usize>,
@@ -25,7 +34,11 @@ pub struct Schema {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ExternalSchema {
     accounting_type: Option<AccountingType>,
+    privacy_units: Option<HashSet<PrivacyUnit>>,
+    block_sliding_window_size: Option<usize>,
+
     attributes: Vec<Attribute>,
+    attributes_pa: Option<Vec<Attribute>>,
 
     #[serde(skip)]
     name_to_index: HashMap<String, usize>,
@@ -61,7 +74,7 @@ pub trait DataValueLookup {
     fn virtual_block_id_iterator(&self) -> MultiProduct<Range<usize>>;
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Attribute {
     pub name: String,
     pub value_domain: ValueDomain,
@@ -88,32 +101,81 @@ pub enum DataValue {
 #[derive(Debug, Clone)]
 pub struct SchemaError(pub String);
 
-pub fn load_schema(filepath: PathBuf, budget: &AccountingType) -> Result<Schema, Error> {
+pub fn load_schema(filepath: PathBuf, budget_total: &BudgetTotal, block_sliding_window_size: Option<usize>) -> Result<Schema, Error> {
     let file = File::open(filepath)?;
     let reader = BufReader::new(file);
 
     // Read the JSON contents of the file as an instance of `User`.
     let external_schema: ExternalSchema = serde_json::from_reader(reader).expect("Parsing Failed");
-    let mut schema = Schema {
-        accounting_type: external_schema
-            .accounting_type
-            .unwrap_or_else(|| AccountingType::zero_clone(budget)),
-        attributes: external_schema.attributes,
-        name_to_index: external_schema.name_to_index,
-    };
 
-    schema.init();
+    let schema = Schema::to_internal(budget_total, block_sliding_window_size, external_schema);
 
     Ok(schema)
     //println!("{:?}", request);
 }
 
+pub fn load_schema_pa(filepath: PathBuf, budget_total: &BudgetTotal, block_sliding_window_size: Option<usize>) -> Result<Schema, Error> {
+    let file = File::open(filepath)?;
+    let reader = BufReader::new(file);
+
+    // Read the JSON contents of the file as an instance of `User`.
+    let mut external_schema: ExternalSchema = serde_json::from_reader(reader).expect("Parsing Failed");
+
+    // we replace the attributes with the attributes_pa
+    external_schema.attributes = external_schema.attributes_pa.clone().expect("No attributes_pa given in schema");
+
+
+
+    let schema = Schema::to_internal(budget_total, block_sliding_window_size, external_schema);
+
+    Ok(schema)
+}
+
+
 impl Schema {
+
+    pub fn to_internal(budget_total: &BudgetTotal, block_sliding_window_size: Option<usize>, external_schema: ExternalSchema) -> Schema {
+
+        let accounting_type = match &budget_total.alphas {
+            Some(rdp) => AccountingType::Rdp { eps_values: RdpAlphas::from_vec(vec![0.0; rdp.len()]).expect("not supported rdp length") },
+            None => external_schema.accounting_type.expect("No accounting type given (neither in cli nor in schema)"),
+        };
+
+        let privacy_units =  match &budget_total.privacy_units {
+            Some(privacy_units) => privacy_units.iter().map(|x| x.clone()).collect(),
+            None => external_schema.privacy_units.expect("No privacy units given (neither in cli nor in schema)"),
+        };
+
+        let block_sliding_window_size = match block_sliding_window_size {
+            Some(block_sliding_window_size) => block_sliding_window_size,
+            None => external_schema.block_sliding_window_size.expect("At the moment, only the block sliding window approach is supported (but was not given neither in cli nor in schema"),
+        };
+
+        let mut schema = Schema {
+            accounting_type,
+            privacy_units,
+            block_sliding_window_size,
+            attributes: external_schema.attributes,
+            name_to_index: external_schema.name_to_index,
+        };
+
+        schema.init();
+
+        println!("Schema: accounting_type={:?}  privacy_units={:?} block_sliding_window={:?} virtual_blocks_schema={:?}", &schema.accounting_type, &schema.privacy_units, &schema.block_sliding_window_size, &schema.attributes);
+
+        schema
+    }
+
+
+
     /// Converts an internal schema to external, to serialize or later use as input
     pub fn to_external(&self) -> ExternalSchema {
         ExternalSchema {
             accounting_type: Some(self.accounting_type.clone()),
+            privacy_units: Some(self.privacy_units.clone()),
             attributes: self.attributes.clone(),
+            attributes_pa: None,
+            block_sliding_window_size: Some(self.block_sliding_window_size),
             name_to_index: Default::default(),
         }
     }
@@ -205,11 +267,11 @@ impl Schema {
         // adding just one one conjunction which is empty -> all virtual blocks match)
         let full_request = RequestBuilder::new(
             RequestId(0),
-            EpsDp { eps: 0.0 },
+            HashMap::from([(PrivacyUnit::User, EpsDp { eps: 0.0 })]),
+            HashMap::new(),
             0,
-            0,
+            None,
             self,
-            Default::default(),
         )
         .or_conjunction(ConjunctionBuilder::new(self).build())
         .build();
@@ -293,9 +355,10 @@ impl fmt::Display for SchemaError {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::BudgetTotal;
+    use crate::dprivacy::privacy_unit::PrivacyUnit;
     use crate::request::resource_path;
     use crate::schema::{load_schema, ExternalSchema};
-    use crate::AccountingType::EpsDp;
     use std::fs::File;
     use std::io::{BufReader, Error};
     use std::path::PathBuf;
@@ -325,10 +388,19 @@ mod tests {
 
     #[test]
     fn test_init_census_schema() {
+
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.0; 13]),
+            convert_block_budgets: false,
+        };
+
+
         let census_schema = load_schema(
             PathBuf::from_str(resource_path(CENSUS_SCHEMA).to_str().unwrap())
                 .expect("Parsing path failed"),
-            &EpsDp { eps: 1.0 },
+            &budget,
+            Some(1),
         );
         census_schema.unwrap().init();
     }
@@ -341,20 +413,37 @@ mod tests {
 
     #[test]
     fn test_init_demo_schema() {
+
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.0; 13]),
+            convert_block_budgets: false,
+        };
+
         let demo_schema = load_schema(
             PathBuf::from_str(resource_path(DEMO_SCHEMA).to_str().unwrap())
                 .expect("Parsing path failed"),
-            &EpsDp { eps: 1.0 },
+            &budget,
+            Some(1),
         );
         demo_schema.unwrap().init()
     }
 
     #[test]
     fn test_census_schema_num_virtual_blocks() {
+
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.0; 13]),
+            convert_block_budgets: false,
+        };
+
+
         let mut census_schema = load_schema(
             PathBuf::from_str(resource_path(CENSUS_SCHEMA).to_str().unwrap())
                 .expect("Parsing path failed"),
-            &EpsDp { eps: 1.0 },
+            &budget,
+            Some(1),
         )
         .unwrap();
         census_schema.init();
@@ -370,10 +459,18 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_init_demo_schema_duplicate_attribute() {
+
+        let budget = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: None,
+            convert_block_budgets: false,
+        };
+
         let demo_schema = load_schema(
             PathBuf::from_str(resource_path(DEMO_SCHEMA_DUPL_ATTR).to_str().unwrap())
                 .expect("Parsing path failed"),
-            &EpsDp { eps: 1.0 },
+            &budget,
+            Some(1),
         );
         demo_schema.unwrap().init();
     }

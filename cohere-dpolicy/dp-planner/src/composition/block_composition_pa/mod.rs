@@ -1,155 +1,221 @@
 use crate::block::{Block, BlockId};
-use crate::composition::block_composition_pa::algo_narray::NArraySegmentation;
+use crate::composition::block_composition_pa::algo_narray::{narray, NArraySegmentation};
 use crate::composition::ProblemFormulation;
 use crate::config::SegmentationAlgo;
 use crate::dprivacy::budget::SegmentBudget;
-use crate::dprivacy::AccountingType;
 use crate::logging::{RuntimeKind, RuntimeMeasurement};
 use crate::request::{Request, RequestId};
 use crate::schema::Schema;
-use float_cmp::{ApproxEq, F64Margin};
+use crate::util;
 use rayon::prelude::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
-
+use std::ops::DerefMut;
+use std::sync::{Arc, Mutex, RwLock};
 use log::debug;
 use std::time::Instant;
-
-use self::algo_hashmap::HashmapSegmentor;
-
+use crate::composition::block_composition_pa::algo_narray::narray::NArray;
 use super::{BlockConstraints, CompositionConstraint};
 
-pub mod algo_hashmap;
 pub mod algo_narray;
 
 pub struct BlockCompositionPartAttributes {
     pub config: SegmentationAlgo,
+    pub num_threads: Option<usize>,
 }
 
-pub fn build_block_part_attributes(config: SegmentationAlgo) -> BlockCompositionPartAttributes {
-    // TODO [eopel] used for building BlockCompositionPartAttributes
-    BlockCompositionPartAttributes { config }
+pub(crate) type NArrayCache = (HashSet<RequestId>, crate::composition::block_composition_pa::algo_narray::narray::NArray<crate::composition::block_composition_pa::algo_narray::VirtualBlockBudget>);
+
+pub fn build_block_part_attributes(config: SegmentationAlgo, num_threads: Option<usize>) -> BlockCompositionPartAttributes {
+    BlockCompositionPartAttributes { config, num_threads}
 }
 
 impl CompositionConstraint for BlockCompositionPartAttributes {
     fn build_problem_formulation<M: SegmentBudget>(
         &self,
         blocks: &HashMap<BlockId, Block>,
-        candidate_requests: &HashMap<RequestId, Request>,
+        candidate_requests: &BTreeMap<RequestId, Request>,
         history_requests: &HashMap<RequestId, Request>,
         schema: &Schema,
         runtime_measurements: &mut Vec<RuntimeMeasurement>,
+        block_narray_cache: &mut HashMap<BlockId, Arc<RwLock<NArrayCache>>>
     ) -> super::ProblemFormulation<M> {
         // TODO [later] request needs concept for specifying which blocks are interesting (can then be used for DPF and also for UserTimeBlocking)
 
         let request_batch: Vec<&Request> = candidate_requests.values().collect();
 
-        // blocks which have either different history or different budget
-        let mut unique_budget_and_history: Vec<(AccountingType, BTreeSet<RequestId>, &Block)> =
-            Vec::new();
-        // for non-unique blocks, store which block is the one which is the same
-        let mut lookup: HashMap<BlockId, BlockId> = HashMap::new();
-        'outer: for block in blocks.values() {
-            let history_set = BTreeSet::from_iter(block.request_history.iter().copied());
-            // only want to add block, if budget is not approx eq to existing budget or history
-            // is different
-            for (budget, history, other_block) in unique_budget_and_history.iter() {
-                if (&block.unlocked_budget).approx_eq(budget, F64Margin::default())
-                    && history == &history_set
-                {
-                    lookup.insert(block.id, other_block.id);
-                    continue 'outer;
-                }
-            }
-            unique_budget_and_history.push((block.unlocked_budget.clone(), history_set, block))
+//        // blocks which have either different history or different budget
+//        let mut unique_budget_and_history: Vec<(AccountingType, BTreeSet<RequestId>, &Block)> =
+//            Vec::new();
+//        // for non-unique blocks, store which block is the one which is the same
+//        let mut lookup: HashMap<BlockId, BlockId> = HashMap::new();
+//        'outer: for block in blocks.values() {
+//            let history_set = BTreeSet::from_iter(block.request_history.iter().copied());
+//            // only want to add block, if budget is not approx eq to existing budget or history
+//            // is different
+//
+//            // FIXME [nku] ONLY LOOKING AT THE DEFAULT BUDGET IS NOT SUFFICIENT ANYMORE -> JUST TAKE ALL BLOCKS
+//                  -> ALTERNATIVELY WE WOULD ALSO NEED TO CHECK THAT THE SECTIONS ARE THE SAME AND THE PRIVACY UNIT OF THE BLOCK IS THE SAME
+//
+//            for (budget, history, other_block) in unique_budget_and_history.iter() {
+//                if (&block.default_unlocked_budget).approx_eq(budget, F64Margin::default())
+//                    && history == &history_set
+//                {
+//                    lookup.insert(block.id, other_block.id);
+//                    continue 'outer;
+//                }
+//            }
+//            unique_budget_and_history.push((block.default_unlocked_budget.clone(), history_set, block))
+//        }
+
+        let num_threads = self.num_threads.unwrap_or_else(num_cpus::get);
+        assert!(
+            num_threads > 0 && num_threads <= num_cpus::get(),
+            "num_threads must be greater than 0 and smaller than or equal \
+        to the number of virtual cores ({}) (given number of threads was {})",
+            num_cpus::get(),
+            num_threads
+        );
+
+        let cache_requests = std::env::var("CACHE_REQUEST_COST").unwrap_or("0".to_string()) == "1";
+
+        // Clear unused block cache
+        if cache_requests {
+            block_narray_cache.retain(|k, _| blocks.contains_key(k));
         }
+        let block_narray_cache = Arc::new(RwLock::new(block_narray_cache));
 
-        let map = unique_budget_and_history
-            .into_par_iter()
-            .map(|(_, _, block)| {
-                let request_history: Vec<&Request> = block
-                    .request_history
-                    .iter()
-                    .map(|r_id| {
-                        history_requests
-                            .get(r_id)
-                            .expect("request id not in history")
-                    })
-                    .collect();
+        let unique_block_constraints = util::create_pool(num_threads)
+            .expect("Failed to create thread pool")
+            .install(|| {
 
-                (block, request_history)
+                let map = blocks
+                    .into_par_iter()
+                    .map(|(_, block)| {
+                        let request_history: Vec<&Request> = block
+                            .request_history
+                            .iter()
+                            .map(|r_id| {
+                                history_requests
+                                    .get(r_id)
+                                    .expect("request id not in history")
+                            })
+                            .collect();
+
+                        (block, request_history)
+                    });
+
+                println!(
+                    "rayon threads = {:?}    blocks to process = {:?}",
+                    rayon::current_num_threads(),
+                    blocks.len()
+                );
+                let start = Instant::now();
+
+                let unique_block_constraints: HashMap<BlockId, BlockConstraints<M>> = match self.config {
+                    SegmentationAlgo::Narray{..} => {
+                        let mut seg_meas = RuntimeMeasurement::start(RuntimeKind::Segmentation);
+                        let segmentation = NArraySegmentation::new(request_batch, schema);
+                        runtime_measurements.push(seg_meas.stop());
+
+                        let mut seg_post_meas = RuntimeMeasurement::start(RuntimeKind::PostSegmentation);
+                        let constraints = map
+                            .map(|(block, request_history)| {
+                                if (cache_requests) {
+                                    let map = block_narray_cache.read().expect("Failed to read block narray cache");
+
+                                    if let Some(cache) = map.get(&block.id) {
+                                        println!("Using cache for block {}", block.id);
+                                        (
+                                            block.id,
+                                            segmentation
+                                                .compute_block_constraints(request_history, &block, Some(cache.write().as_deref_mut().expect("Failed to get mutable reference to cache"))),
+                                        )
+                                    } else {
+                                        // Insert new cache
+                                        println!("Did not find cache for block {}", block.id);
+
+                                        drop(map);
+
+                                        // Run on fresh cache
+                                        let mut fresh_cache = segmentation.new_cache();
+                                        let constraints = segmentation
+                                            .compute_block_constraints(request_history, &block, Some(&mut fresh_cache));
+
+                                        let mut map = block_narray_cache.write().expect("Failed to write block narray cache");
+                                        map.insert(block.id, Arc::new(RwLock::new(fresh_cache)));
+                                        println!("Storing cache for block {}", block.id);
+
+                                        (
+                                            block.id,
+                                            constraints
+                                        )
+                                    }
+                                } else {
+                                    (
+                                        block.id,
+                                        segmentation
+                                            .compute_block_constraints(request_history, &block, None),
+                                    )
+                                }
+
+                                //
+                                // let default = Arc::new(RwLock::new(segmentation.new_cache()));
+                                // let mut write_guard = block_narray_cache.write().expect("Failed to write block narray cache");
+                                // write_guard.insert(block.id, default);
+                                //
+                                // let cache = block_narray_cache.read().expect("Failed to read block narray cache")
+                                //     .get(&block.id).unwrap(); // safe to unwrap, as we just inserted it
+                                // let mut write_cache = cache.write().expect("Failed to write block narray cache");
+                                //
+                                // // .unwrap_or_else(|| {
+                                // //
+                                // //     });
+                                //
+                                // (
+                                //     block.id,
+                                //     segmentation
+                                //         .compute_block_constraints(request_history, &block, Some(write_cache.deref_mut())),
+                                // )
+                            })
+                            .collect();
+
+                        // loop so we can capture narray_cache // TODO: Remove
+                        // let mut constraints: HashMap<BlockId, BlockConstraints<M>> = HashMap::new();
+                        // for (block, request_history) in map {
+                        //     constraints.insert(block.id, segmentation.compute_block_constraints(request_history, &block, &mut narray_cache));
+                        // }
+                        runtime_measurements.push(seg_post_meas.stop());
+
+                        constraints
+                    }
+                };
+
+                debug!(
+                    "rayon threads = {:?}    elapsed hist={:?}",
+                    rayon::current_num_threads(),
+                    start.elapsed()
+                );
+
+                unique_block_constraints
             });
 
-        // println!("{:?}", map.)
-        debug!(
-            "rayon threads = {:?}    unique block histories = {:?}",
-            rayon::current_num_threads(),
-            map.len()
-        );
-        let start = Instant::now();
+        // NOTE: As we don't process only the unique blocks anymore, we don't need the lookup here.
+        let block_constraints = unique_block_constraints;
+        //let block_constraints = blocks
+        //    .iter()
+        //    .map({
+        //        |(bid, _)| {
+        //            if unique_block_constraints.contains_key(bid) {
+        //                (*bid, unique_block_constraints[bid].clone())
+        //            } else {
+        //                (*bid, unique_block_constraints[&lookup[bid]].clone())
+        //            }
+        //        }
+        //    })
+        //    .collect();
 
-        let unique_block_constraints: HashMap<BlockId, BlockConstraints<M>> = match self.config {
-            SegmentationAlgo::Narray => {
-                let mut seg_meas = RuntimeMeasurement::start(RuntimeKind::Segmentation);
-                let segmentation = NArraySegmentation::new(request_batch, schema);
-                runtime_measurements.push(seg_meas.stop());
-
-                let mut seg_post_meas = RuntimeMeasurement::start(RuntimeKind::PostSegmentation);
-                let constraints = map
-                    .map(|(block, request_history)| {
-                        (
-                            block.id,
-                            segmentation
-                                .compute_block_constraints(request_history, &block.unlocked_budget),
-                        )
-                    })
-                    .collect();
-                runtime_measurements.push(seg_post_meas.stop());
-
-                constraints
-            }
-            SegmentationAlgo::Hashmap => {
-                let mut seg_meas = RuntimeMeasurement::start(RuntimeKind::Segmentation);
-                let segmentation = HashmapSegmentor::new(request_batch, schema);
-                runtime_measurements.push(seg_meas.stop());
-
-                let mut seg_post_meas = RuntimeMeasurement::start(RuntimeKind::PostSegmentation);
-
-                let constraints = map
-                    .map(|(block, request_history)| {
-                        (
-                            block.id,
-                            segmentation
-                                .compute_block_constraints(request_history, &block.unlocked_budget),
-                        )
-                    })
-                    .collect();
-
-                runtime_measurements.push(seg_post_meas.stop());
-                constraints
-            }
-        };
-
-        debug!(
-            "rayon threads = {:?}    elapsed hist={:?}",
-            rayon::current_num_threads(),
-            start.elapsed()
-        );
-
-        let block_constraints = blocks
-            .iter()
-            .map({
-                |(bid, _)| {
-                    if unique_block_constraints.contains_key(bid) {
-                        (*bid, unique_block_constraints[bid].clone())
-                    } else {
-                        (*bid, unique_block_constraints[&lookup[bid]].clone())
-                    }
-                }
-            })
-            .collect();
-
-        ProblemFormulation::new(block_constraints, candidate_requests)
+        ProblemFormulation::new(block_constraints, candidate_requests, blocks)
     }
 }
 
@@ -158,10 +224,13 @@ impl CompositionConstraint for BlockCompositionPartAttributes {
 pub trait Segmentation<'r, 's> {
     fn new(request_batch: Vec<&'r Request>, schema: &'s Schema) -> Self;
 
+    fn new_cache(&self) -> NArrayCache;
+
     fn compute_block_constraints<M: SegmentBudget + Debug>(
         &self,
         request_history: Vec<&Request>,
-        initial_block_budget: &AccountingType,
+        block: &Block,
+        narray_cache: Option<&mut NArrayCache>
     ) -> BlockConstraints<M>;
 }
 
@@ -170,27 +239,27 @@ mod tests {
 
     use float_cmp::{ApproxEq, F64Margin};
 
+    use crate::block::{Block, BlockId};
     use crate::composition::{BlockConstraints, BlockSegment};
+    use crate::config::BudgetTotal;
     use crate::dprivacy::budget::{OptimalBudget, SegmentBudget};
+    use crate::dprivacy::privacy_unit::PrivacyUnit;
     use crate::dprivacy::{AccountingType, AdpAccounting};
 
     use crate::request::{
-        AttributeId, ConjunctionBuilder, Predicate, Request, RequestBuilder, RequestId,
+        load_requests, resource_path, AttributeId, ConjunctionBuilder, Predicate, Request, RequestBuilder, RequestId
     };
     use crate::schema::{load_schema, Attribute, Schema, ValueDomain};
 
-    use crate::request::{load_requests, resource_path};
-
-    use crate::dprivacy::AccountingType::{EpsDeltaDp, Rdp};
-    use crate::util::{CENSUS_REQUESTS, CENSUS_SCHEMA};
+    use crate::simulation::RoundId;
+    use crate::dprivacy::AccountingType::EpsDeltaDp;
 
     use crate::dprivacy::rdp_alphas_accounting::RdpAlphas::*;
-    use crate::RequestAdapter;
+    use crate::util::{CENSUS_REQUESTS, CENSUS_SCHEMA};
     use itertools::Itertools;
     use std::collections::{HashMap, HashSet};
     use std::time::Instant;
 
-    use super::algo_hashmap::HashmapSegmentor;
     use super::algo_narray::NArraySegmentation;
     use super::Segmentation;
 
@@ -204,29 +273,17 @@ mod tests {
 
         let algo = NArraySegmentation::new(request_batch.iter().collect(), &schema);
 
+        let block = build_dummy_block(AccountingType::EpsDp { eps: 1.0 }, request_history);
+
+
         let problem: BlockConstraints<OptimalBudget> = algo.compute_block_constraints(
             request_history.iter().collect(),
-            &AccountingType::EpsDp { eps: 1.0 },
+            &block,
         );
 
         check_dummy_problem_formulation(problem);
     }
 
-    #[test]
-    fn test_hashmap_segmentation_dummy() {
-        let schema = build_dummy_schema();
-
-        let requests = build_dummy_requests(&schema);
-        let request_history = requests[0..2].iter().collect();
-        let request_batch = requests[2..6].iter().collect();
-
-        let algo = HashmapSegmentor::new(request_batch, &schema);
-
-        let problem: BlockConstraints<OptimalBudget> =
-            algo.compute_block_constraints(request_history, &AccountingType::EpsDp { eps: 1.0 });
-
-        check_dummy_problem_formulation(problem);
-    }
 
     fn build_dummy_schema() -> Schema {
         // test with two partitioning attributes one with two values and the other with three
@@ -247,21 +304,40 @@ mod tests {
             accounting_type: AccountingType::EpsDp { eps: 1.0 },
             attributes,
             name_to_index: HashMap::new(),
+            privacy_units: HashSet::from([PrivacyUnit::User]),
+            block_sliding_window_size: 1,
+        }
+    }
+
+    fn build_dummy_block(budget: AccountingType, request_history: &[Request]) -> Block {
+
+        Block {
+            id: BlockId(0),
+            request_history: request_history.iter().map(|r| r.request_id).collect(),
+            default_unlocked_budget: Some(budget.clone()),
+            default_total_budget: Some(budget.clone()),
+            budget_by_section: Vec::new(),
+            privacy_unit: PrivacyUnit::User,
+            privacy_unit_selection: None,
+            created: RoundId(0),
+            retired: None,
         }
     }
 
     fn build_dummy_requests(schema: &Schema) -> Vec<Request> {
         // with budget 1.0, on each virtual block we can run 2 but not three requests
         let request_cost = AccountingType::EpsDp { eps: 0.4 };
+        let request_cost = HashMap::from([(PrivacyUnit::User, request_cost)]);
+        let unit_selection = HashMap::new();
 
         let requests = vec![
             RequestBuilder::new(
                 RequestId(0),
                 request_cost.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -272,10 +348,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(1),
                 request_cost.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -286,10 +362,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(2),
                 request_cost.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -301,10 +377,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(3),
                 request_cost.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -315,10 +391,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(4),
                 request_cost.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -335,10 +411,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(5),
                 request_cost,
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -430,35 +506,18 @@ mod tests {
 
         let algo = NArraySegmentation::new(request_batch.iter().collect(), &schema);
 
+        let block = build_dummy_block(AccountingType::Rdp {
+            eps_values: A5([3., 0., 0., 0., 3.]),
+        }, request_history);
+
         let problem: BlockConstraints<OptimalBudget> = algo.compute_block_constraints(
             request_history.iter().collect(),
-            &AccountingType::Rdp {
-                eps_values: A5([3., 0., 0., 0., 3.]),
-            },
+            &block
         );
 
         check_dummy_problem_formulation_rdp(problem);
     }
 
-    #[test]
-    fn test_hashmap_segmentation_dummy_rdp() {
-        let schema = build_dummy_schema_rdp();
-
-        let requests = build_dummy_requests_rdp(&schema);
-        let request_history: Vec<&Request> = requests[0..2].iter().collect();
-        let request_batch: Vec<&Request> = requests[2..requests.len()].iter().collect();
-
-        let algo = HashmapSegmentor::new(request_batch, &schema);
-
-        let problem: BlockConstraints<OptimalBudget> = algo.compute_block_constraints(
-            request_history,
-            &AccountingType::Rdp {
-                eps_values: A5([3., 0., 0., 0., 3.]),
-            },
-        );
-
-        check_dummy_problem_formulation_rdp(problem);
-    }
 
     fn build_dummy_schema_rdp() -> Schema {
         // test with two partitioning attributes one with two values and the other with three
@@ -481,6 +540,8 @@ mod tests {
             },
             attributes,
             name_to_index: HashMap::new(),
+            privacy_units: HashSet::from([PrivacyUnit::User]),
+            block_sliding_window_size: 1,
         }
     }
 
@@ -489,18 +550,22 @@ mod tests {
         let request_cost1 = AccountingType::Rdp {
             eps_values: A5([2., 1., 1., 1., 1.]),
         };
+        let request_cost1 = HashMap::from([(PrivacyUnit::User, request_cost1)]);
         let request_cost2 = AccountingType::Rdp {
             eps_values: A5([1., 1., 1., 1., 2.]),
         };
+        let request_cost2 = HashMap::from([(PrivacyUnit::User, request_cost2)]);
+
+        let unit_selection = HashMap::new();
 
         let requests = vec![
             RequestBuilder::new(
                 RequestId(0),
                 request_cost1.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -512,10 +577,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(1),
                 request_cost2.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -527,10 +592,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(2),
                 request_cost1.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -542,10 +607,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(3),
                 request_cost1.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -557,10 +622,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(4),
                 request_cost2.clone(),
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -572,10 +637,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(5),
                 request_cost1,
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -587,10 +652,10 @@ mod tests {
             RequestBuilder::new(
                 RequestId(6),
                 request_cost2,
+                unit_selection.clone(),
                 1,
                 1,
                 schema,
-                std::default::Default::default(),
             )
             .or_conjunction(
                 ConjunctionBuilder::new(schema)
@@ -720,19 +785,19 @@ mod tests {
 
         let mut durations = (0u128, 0u128);
 
-        let rdp13: AccountingType = Rdp {
-            eps_values: A13([0f64; 13]),
+        let rdp13 = BudgetTotal{
+            privacy_units: Some(vec![PrivacyUnit::User]),
+            alphas: Some(vec![0.; 13]),
+            convert_block_budgets: false,
         };
 
         let census_schema =
-            load_schema(resource_path(CENSUS_SCHEMA), &rdp13).expect("Loading schema failed");
+            load_schema(resource_path(CENSUS_SCHEMA), &rdp13, Some(1)).expect("Loading schema failed");
 
         // loads requests and converts them to internal format
         let census_requests = load_requests(
             resource_path(CENSUS_REQUESTS),
             &census_schema,
-            &mut RequestAdapter::get_empty_adapter(),
-            &None,
         )
         .expect("Loading requests failed");
 
@@ -784,166 +849,179 @@ mod tests {
             1.5, 1.75, 2., 2.5, 3., 4., 5., 6., 8., 16., 32., 64., 1000000.,
         ]));
 
-        let history_valid_algo_hash =
-            test_request_history_algo_hash(request_history, census_schema, initial_budget);
-        let history_valid_algo_narray =
-            test_request_history_algo_narray(request_history, census_schema, initial_budget);
+        let block = Block {
+            id: BlockId(0),
+            request_history: request_history.iter().map(|r| r.request_id).collect(),
+            default_unlocked_budget: Some(initial_budget.clone()),
+            default_total_budget: Some(initial_budget.clone()),
+            budget_by_section: Vec::new(),
+            created: RoundId(0),
+            privacy_unit: PrivacyUnit::User,
+            privacy_unit_selection: None,
+            retired: None,
+        };
 
-        assert_eq!(
-            history_valid_algo_hash, history_valid_algo_narray,
-            "Algorithms returned different results whether history is valid"
-        );
+        //let history_valid_algo_hash =
+        //    test_request_history_algo_hash(request_history, census_schema, initial_budget);
+        let _history_valid_algo_narray =
+            test_request_history_algo_narray(request_history, census_schema, &block);
 
-        println!("History Valid: {}", history_valid_algo_hash);
+        //assert_eq!(
+        //    history_valid_algo_hash, history_valid_algo_narray,
+        //    "Algorithms returned different results whether history is valid"
+        //);
+//
+        //println!("History Valid: {}", history_valid_algo_hash);
 
-        println!("running algo_hashmap...");
-        let algo_hash_start = Instant::now();
-        let algo_hash = HashmapSegmentor::new(request_batch.iter().collect(), census_schema);
-
-        let problem_formulation_algo_hash: BlockConstraints<OptimalBudget> =
-            algo_hash.compute_block_constraints(request_history.iter().collect(), initial_budget);
-        let algo_hash_duration = algo_hash_start.elapsed().as_millis();
-        println!("Algo_hash duration: {} msec", algo_hash_duration);
+        //println!("running algo_hashmap...");
+        //let algo_hash_start = Instant::now();
+        //let algo_hash = HashmapSegmentor::new(request_batch.iter().collect(), census_schema);
+//
+        //let problem_formulation_algo_hash: BlockConstraints<OptimalBudget> =
+        //    algo_hash.compute_block_constraints(request_history.iter().collect(), initial_budget);
+        //let algo_hash_duration = algo_hash_start.elapsed().as_millis();
+        //println!("Algo_hash duration: {} msec", algo_hash_duration);
+        let algo_hash_duration = 0;
 
         println!("running algo_narray...");
         let algo_narray_start = Instant::now();
         let algo_narray = NArraySegmentation::new(request_batch.iter().collect(), census_schema);
-        let problem_formulation_algo_narray: BlockConstraints<OptimalBudget> =
-            algo_narray.compute_block_constraints(request_history.iter().collect(), initial_budget);
+        let _problem_formulation_algo_narray: BlockConstraints<OptimalBudget> =
+            algo_narray.compute_block_constraints(request_history.iter().collect(), &block, );
 
         let algo_narray_duration = algo_narray_start.elapsed().as_millis();
         println!("Algo_narray duration: {} msec", algo_narray_duration);
-        let pfs = (
-            problem_formulation_algo_hash,
-            problem_formulation_algo_narray,
-        );
-
-        assert_eq!(
-            pfs.0.acceptable, pfs.1.acceptable,
-            "Accepted requests were not the same : AlgoHash: {:?}, AlgoNarray: {:?}",
-            &pfs.0.acceptable, &pfs.1.acceptable
-        );
-        assert_eq!(
-            pfs.0.rejected, pfs.1.rejected,
-            "Rejected requests were not the same : AlgoHash: {:?}, AlgoNarray: {:?}",
-            &pfs.0.rejected, &pfs.1.rejected
-        );
-        assert_eq!(
-            pfs.0.contested, pfs.1.contested,
-            "Undecided requests were not the same : AlgoHash: {:?}, AlgoNarray: {:?}",
-            &pfs.0.contested, &pfs.1.contested
-        );
-
-        println!(
-            "#Accepted: {}, #Rejected: {}, #Undecided: {}",
-            pfs.0.acceptable.len(),
-            pfs.0.rejected.len(),
-            pfs.0.contested.len()
-        );
-
-        segments_check(
-            pfs.0.contested_segments,
-            pfs.1.contested_segments,
-            "Algo Hash",
-            "Algo Narray",
-        );
-
+//        let pfs = (
+//            problem_formulation_algo_hash,
+//            problem_formulation_algo_narray,
+//        );
+//
+//        assert_eq!(
+//            pfs.0.acceptable, pfs.1.acceptable,
+//            "Accepted requests were not the same : AlgoHash: {:?}, AlgoNarray: {:?}",
+//            &pfs.0.acceptable, &pfs.1.acceptable
+//        );
+//        assert_eq!(
+//            pfs.0.rejected, pfs.1.rejected,
+//            "Rejected requests were not the same : AlgoHash: {:?}, AlgoNarray: {:?}",
+//            &pfs.0.rejected, &pfs.1.rejected
+//        );
+//        assert_eq!(
+//            pfs.0.contested, pfs.1.contested,
+//            "Undecided requests were not the same : AlgoHash: {:?}, AlgoNarray: {:?}",
+//            &pfs.0.contested, &pfs.1.contested
+//        );
+//
+//        println!(
+//            "#Accepted: {}, #Rejected: {}, #Undecided: {}",
+//            pfs.0.acceptable.len(),
+//            pfs.0.rejected.len(),
+//            pfs.0.contested.len()
+//        );
+//
+//        segments_check(
+//            pfs.0.contested_segments,
+//            pfs.1.contested_segments,
+//            "Algo Hash",
+//            "Algo Narray",
+//        );
+//
         (algo_hash_duration, algo_narray_duration)
     }
 
-    fn test_request_history_algo_hash(
-        request_history: &[Request],
-        schema: &Schema,
-        initial_block_budget: &AccountingType,
-    ) -> bool {
-        let hashmap_segmentor = HashmapSegmentor::new(request_history.iter().collect(), schema);
-        let pf = hashmap_segmentor
-            .compute_block_constraints::<OptimalBudget>(Vec::new(), initial_block_budget);
-        pf.acceptable.len() == request_history.len()
-    }
+//    fn test_request_history_algo_hash(
+//        request_history: &[Request],
+//        schema: &Schema,
+//        initial_block_budget: &AccountingType,
+//    ) -> bool {
+//        let hashmap_segmentor = HashmapSegmentor::new(request_history.iter().collect(), schema);
+//        let pf = hashmap_segmentor
+//            .compute_block_constraints::<OptimalBudget>(Vec::new(), initial_block_budget);
+//        pf.acceptable.len() == request_history.len()
+//    }
 
     fn test_request_history_algo_narray(
         request_history: &[Request],
         schema: &Schema,
-        initial_block_budget: &AccountingType,
+        block: &Block,
     ) -> bool {
         let narray_segmentor = NArraySegmentation::new(request_history.iter().collect(), schema);
         let pf = narray_segmentor
-            .compute_block_constraints::<OptimalBudget>(Vec::new(), initial_block_budget);
+            .compute_block_constraints::<OptimalBudget>(Vec::new(), block, );
         pf.acceptable.len() == request_history.len()
     }
 
-    fn segments_check<M: SegmentBudget + Clone>(
-        segs1: Vec<BlockSegment<M>>,
-        segs2: Vec<BlockSegment<M>>,
-        algo1name: &str,
-        algo2name: &str,
-    ) {
-        assert_eq!(
-            segs1.len(),
-            segs2.len(),
-            "Different number of contested segments"
-        );
-
-        // check that all of the request ids are initialized
-        let mut segment1_map: HashMap<Vec<RequestId>, BlockSegment<M>> = HashMap::new();
-        for mut segment in segs1 {
-            let id_option = segment.request_ids.as_mut();
-            assert!(
-                id_option.is_some(),
-                "Request ids were None for some segment in {}",
-                algo1name
-            );
-            let mut id = id_option.unwrap().clone();
-            assert!(
-                !id.is_empty(),
-                "Some segment in {} had no associated request ids",
-                algo1name
-            );
-            id.sort_unstable();
-            let inserted = segment1_map.insert(id.clone(), segment);
-            assert!(
-                inserted.is_none(),
-                "Duplicate request id in {}: {:?}",
-                algo1name,
-                &id
-            );
-        }
-
-        for mut segment in segs2 {
-            let id_option = segment.request_ids.as_mut();
-            assert!(
-                id_option.is_some(),
-                "Request ids were none for some segment in {}",
-                algo2name
-            );
-            let mut id = id_option.unwrap().clone();
-            assert!(
-                !id.is_empty(),
-                "Some segment in {} had no associated request ids",
-                algo2name
-            );
-            id.sort_unstable();
-            let removed = segment1_map.remove(&id);
-            assert!(
-                removed.is_some(),
-                "Segment with request ids {:?} of {} not found in {}",
-                &id,
-                algo2name,
-                algo1name
-            );
-            assert!(removed
-                .unwrap()
-                .remaining_budget
-                .approx_eq(&segment.remaining_budget, F64Margin::default()));
-        }
-
-        assert!(
-            // should actually never trigger this, as segs1.len() == segs2.len()
-            segment1_map.is_empty(),
-            "Some segments of {} not present in {}",
-            algo1name,
-            algo2name
-        );
-    }
+//    fn segments_check<M: SegmentBudget + Clone>(
+//        segs1: Vec<BlockSegment<M>>,
+//        segs2: Vec<BlockSegment<M>>,
+//        algo1name: &str,
+//        algo2name: &str,
+//    ) {
+//        assert_eq!(
+//            segs1.len(),
+//            segs2.len(),
+//            "Different number of contested segments"
+//        );
+//
+//        // check that all of the request ids are initialized
+//        let mut segment1_map: HashMap<Vec<RequestId>, BlockSegment<M>> = HashMap::new();
+//        for mut segment in segs1 {
+//            let id_option = segment.request_ids.as_mut();
+//            assert!(
+//                id_option.is_some(),
+//                "Request ids were None for some segment in {}",
+//                algo1name
+//            );
+//            let mut id = id_option.unwrap().clone();
+//            assert!(
+//                !id.is_empty(),
+//                "Some segment in {} had no associated request ids",
+//                algo1name
+//            );
+//            id.sort_unstable();
+//            let inserted = segment1_map.insert(id.clone(), segment);
+//            assert!(
+//                inserted.is_none(),
+//                "Duplicate request id in {}: {:?}",
+//                algo1name,
+//                &id
+//            );
+//        }
+//
+//        for mut segment in segs2 {
+//            let id_option = segment.request_ids.as_mut();
+//            assert!(
+//                id_option.is_some(),
+//                "Request ids were none for some segment in {}",
+//                algo2name
+//            );
+//            let mut id = id_option.unwrap().clone();
+//            assert!(
+//                !id.is_empty(),
+//                "Some segment in {} had no associated request ids",
+//                algo2name
+//            );
+//            id.sort_unstable();
+//            let removed = segment1_map.remove(&id);
+//            assert!(
+//                removed.is_some(),
+//                "Segment with request ids {:?} of {} not found in {}",
+//                &id,
+//                algo2name,
+//                algo1name
+//            );
+//            assert!(removed
+//                .unwrap()
+//                .remaining_budget
+//                .approx_eq(&segment.remaining_budget, F64Margin::default()));
+//        }
+//
+//        assert!(
+//            // should actually never trigger this, as segs1.len() == segs2.len()
+//            segment1_map.is_empty(),
+//            "Some segments of {} not present in {}",
+//            algo1name,
+//            algo2name
+//        );
+//    }
 }

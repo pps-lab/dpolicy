@@ -2,7 +2,7 @@
   {
     "id": 1,
     "request_ids": [1,2,3],
-    "unlocked_budget": {
+    "total_budget": {
       "EpsDp":{
         "eps": 1.0
       }
@@ -12,7 +12,7 @@
   {
     "id": 1,
     "request_ids": [1,4],
-    "unlocked_budget": {
+    "total_budget": {
       "EpsDeltaDp":{
         "eps": 1.0,
         "delta": 0.01
